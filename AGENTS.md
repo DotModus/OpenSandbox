@@ -1,3 +1,40 @@
+# Patch fork
+
+This repository is a fork of `opensandbox-group/OpenSandbox`. It exists only
+to carry a small, tracked set of local patches against released component
+tags. It is not a general OpenSandbox playground.
+
+## Rules
+
+- Branch from the released component **tag** the patch targets, never from
+  floating `main`. One branch per concern.
+- Do not merge or fast-forward upstream `main` into a patch branch.
+- GitHub Actions are **disabled** here; upstream publish and e2e workflows
+  cannot succeed on a fork. Confirm with:
+
+  ```bash
+  gh api repos/DotModus/OpenSandbox/actions/permissions
+  ```
+
+- Never open a pull request or issue against `opensandbox-group`.
+  `gh pr create` from a fork defaults to the **parent**, so always pass
+  `--repo DotModus/OpenSandbox` and base the PR on the patch branch.
+- **Never reference anything downstream of this repository.** No product
+  names, private repository names, internal tracker or document paths,
+  registries, environments, deployments, or customer names — in code,
+  comments, documentation, file names, branch names, commit messages, or
+  pull request and issue text. The patches themselves are public and that
+  is fine; where they are consumed is not, and this is a public repository.
+
+## Patch branches
+
+| Branch | Base tag | Concern |
+| ------ | -------- | ------- |
+| `egress-nft-redirect` | `docker/egress/v1.1.6` | native nftables DNS and transparent redirects (upstream PR 1374) |
+| `committer-skip-sidecar` | `k8s/image-committer/v0.1.1` | skip non-restorable containers in image-committer |
+
+---
+
 # OpenSandbox AGENTS
 
 Use this file as the root router for the monorepo. Prefer the nearest `AGENTS.md` in the directory tree for task-specific instructions.
