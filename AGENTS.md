@@ -1,3 +1,31 @@
+# Objective fork
+
+This repository is **DotModus/OpenSandbox**, a fork of
+`opensandbox-group/OpenSandbox`. It exists only to carry the patches listed in
+`objective_infrastructure` `docs/opensandbox/maintenance/evidence/fork-inventory.md`.
+
+Do not treat this as a general OpenSandbox playground. Do not merge upstream
+`main` into a patch branch. Branch from the Phase 2 component **tags**.
+
+GitHub Actions are **disabled** on this fork (upstream publish/e2e cannot
+succeed here). Confirm with:
+
+```bash
+gh api repos/DotModus/OpenSandbox/actions/permissions
+```
+
+## Patch branches
+
+| Branch | Base tag | Concern |
+| ------ | -------- | ------- |
+| `egress-nft-redirect` | `docker/egress/v1.1.6` | MITM nft redirects (upstream PR 1374) |
+| `committer-skip-sidecar` | `k8s/image-committer/v0.1.1` | skip egress sidecar in image-committer |
+
+dns+nft is **not** forked. Product patches are not on these branches until
+Phase 3.2 / 3.3.
+
+---
+
 # OpenSandbox AGENTS
 
 Use this file as the root router for the monorepo. Prefer the nearest `AGENTS.md` in the directory tree for task-specific instructions.
