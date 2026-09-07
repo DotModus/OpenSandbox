@@ -180,6 +180,7 @@ func TestWriteSnapshotResultWritesTerminationMessage(t *testing.T) {
 			"main":    "sha256:main",
 			"sidecar": "sha256:sidecar",
 		},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("writeSnapshotResult failed: %v", err)
@@ -202,5 +203,110 @@ func TestWriteSnapshotResultWritesTerminationMessage(t *testing.T) {
 	}
 	if result.Containers[1].Name != "sidecar" || result.Containers[1].Digest != "sha256:sidecar" {
 		t.Fatalf("unexpected second result: %#v", result.Containers[1])
+	}
+	if len(result.Skipped) != 0 {
+		t.Fatalf("expected no skipped containers, got %v", result.Skipped)
+	}
+}
+
+func TestWriteSnapshotResultRecordsSkippedContainers(t *testing.T) {
+	original := terminationMessagePath
+	t.Cleanup(func() { terminationMessagePath = original })
+	terminationMessagePath = filepath.Join(t.TempDir(), "termination.log")
+
+	err := writeSnapshotResult(
+		[]ContainerSpec{{Name: "sandbox", URI: "registry.example.com/sandbox:snap"}},
+		map[string]string{"sandbox": "sha256:sandbox"},
+		[]ContainerSpec{{Name: "egress", URI: "registry.example.com/egress:snap"}},
+	)
+	if err != nil {
+		t.Fatalf("writeSnapshotResult failed: %v", err)
+	}
+
+	data, err := os.ReadFile(terminationMessagePath)
+	if err != nil {
+		t.Fatalf("failed to read termination message: %v", err)
+	}
+
+	var result snapshotResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		t.Fatalf("termination message is not valid JSON: %v", err)
+	}
+	if len(result.Containers) != 1 || result.Containers[0].Name != "sandbox" {
+		t.Fatalf("expected only the sandbox container result, got %#v", result.Containers)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0] != "egress" {
+		t.Fatalf("expected egress recorded as skipped, got %v", result.Skipped)
+	}
+}
+
+func TestSkippedContainerNamesDefaultsToSidecarAndInit(t *testing.T) {
+	// t.Setenv registers the restore; Unsetenv then gives this test an
+	// a genuinely unset variable without leaking it into the rest of the package.
+	t.Setenv("SNAPSHOT_SKIP_CONTAINERS", "")
+	os.Unsetenv("SNAPSHOT_SKIP_CONTAINERS")
+
+	skipped := skippedContainerNames()
+
+	if !skipped["egress"] {
+		t.Fatal("egress sidecar must be skipped by default")
+	}
+	if !skipped["execd-installer"] {
+		t.Fatal("execd bootstrap init container must be skipped by default")
+	}
+	if skipped["sandbox"] {
+		t.Fatal("the sandbox container must never be skipped by default")
+	}
+}
+
+func TestSkippedContainerNamesHonoursOverride(t *testing.T) {
+	t.Setenv("SNAPSHOT_SKIP_CONTAINERS", " proxy , , logger ")
+
+	skipped := skippedContainerNames()
+
+	if len(skipped) != 2 || !skipped["proxy"] || !skipped["logger"] {
+		t.Fatalf("unexpected skip set %v", skipped)
+	}
+	if skipped["egress"] {
+		t.Fatal("override must replace the default skip list, not extend it")
+	}
+}
+
+func TestSkippedContainerNamesEmptyOverrideCommitsEverything(t *testing.T) {
+	t.Setenv("SNAPSHOT_SKIP_CONTAINERS", "")
+
+	if skipped := skippedContainerNames(); len(skipped) != 0 {
+		t.Fatalf("empty override must commit every container, got %v", skipped)
+	}
+}
+
+func TestPartitionContainerSpecsKeepsSandboxAndSkipsSidecars(t *testing.T) {
+	specs := []ContainerSpec{
+		{Name: "sandbox", URI: "registry.example.com/sandbox:snap"},
+		{Name: "egress", URI: "registry.example.com/egress:snap"},
+		{Name: "execd-installer", URI: "registry.example.com/execd:snap"},
+	}
+
+	commit, skip := partitionContainerSpecs(specs, skippedContainerNames())
+
+	if len(commit) != 1 || commit[0].Name != "sandbox" {
+		t.Fatalf("expected only the sandbox container to be committed, got %#v", commit)
+	}
+	if len(skip) != 2 || skip[0].Name != "egress" || skip[1].Name != "execd-installer" {
+		t.Fatalf("expected both sidecars skipped in order, got %#v", skip)
+	}
+}
+
+func TestPartitionContainerNamesSkipsSidecarsForUnpause(t *testing.T) {
+	keep, skip := partitionContainerNames(
+		[]string{"sandbox", "egress"},
+		skippedContainerNames(),
+	)
+
+	if len(keep) != 1 || keep[0] != "sandbox" {
+		t.Fatalf("expected only the sandbox container to be unpaused, got %v", keep)
+	}
+	if len(skip) != 1 || skip[0] != "egress" {
+		t.Fatalf("expected the egress sidecar to be skipped, got %v", skip)
 	}
 }

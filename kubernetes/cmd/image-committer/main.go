@@ -59,8 +59,63 @@ type ContainerSpec struct {
 	URI  string
 }
 
+// defaultSkippedContainers are the containers a sandbox snapshot never restores
+// from. Restore selects the container named "sandbox"; the egress sidecar and
+// the execd bootstrap init container are recreated from their own pinned images.
+// Committing them is wasted work, and the multi-arch egress sidecar cannot be
+// pushed at all - its reduced-platform commit has no content digest in the
+// registry - which fails the whole snapshot job.
+var defaultSkippedContainers = []string{"egress", "execd-installer"}
+
+// skippedContainerNames returns the containers this committer must not commit,
+// push, pause, or unpause. SNAPSHOT_SKIP_CONTAINERS overrides the default with
+// a comma-separated list; setting it to an empty value commits every container.
+func skippedContainerNames() map[string]bool {
+	names := defaultSkippedContainers
+	if raw, ok := os.LookupEnv("SNAPSHOT_SKIP_CONTAINERS"); ok {
+		names = strings.Split(raw, ",")
+	}
+
+	skipped := make(map[string]bool, len(names))
+	for _, name := range names {
+		if trimmed := strings.TrimSpace(name); trimmed != "" {
+			skipped[trimmed] = true
+		}
+	}
+	return skipped
+}
+
+// partitionContainerSpecs splits parsed specs into the ones to snapshot and the
+// ones to skip, preserving the caller's order in both.
+func partitionContainerSpecs(specs []ContainerSpec, skipped map[string]bool) ([]ContainerSpec, []ContainerSpec) {
+	var commit, skip []ContainerSpec
+	for _, spec := range specs {
+		if skipped[spec.Name] {
+			skip = append(skip, spec)
+			continue
+		}
+		commit = append(commit, spec)
+	}
+	return commit, skip
+}
+
+// partitionContainerNames is partitionContainerSpecs for the bare container
+// names the unpause subcommand takes.
+func partitionContainerNames(names []string, skipped map[string]bool) ([]string, []string) {
+	var keep, skip []string
+	for _, name := range names {
+		if skipped[name] {
+			skip = append(skip, name)
+			continue
+		}
+		keep = append(keep, name)
+	}
+	return keep, skip
+}
+
 type snapshotResult struct {
 	Containers []snapshotContainerResult `json:"containers"`
+	Skipped    []string                  `json:"skipped,omitempty"`
 }
 
 type snapshotContainerResult struct {
@@ -144,6 +199,17 @@ func main() {
 	fmt.Printf("Namespace: %s\n", namespace)
 	for _, spec := range containerSpecs {
 		fmt.Printf("Container spec: %s -> %s\n", spec.Name, spec.URI)
+	}
+
+	// Drop the containers that are not part of the restorable snapshot before
+	// anything is paused, so a sidecar that cannot be pushed never fails the job.
+	containerSpecs, skippedSpecs := partitionContainerSpecs(containerSpecs, skippedContainerNames())
+	for _, spec := range skippedSpecs {
+		fmt.Printf("Skipping container '%s': not restored from a snapshot image\n", spec.Name)
+	}
+	if len(containerSpecs) == 0 {
+		fmt.Fprintln(os.Stderr, "ERROR: every requested container is on the snapshot skip list; nothing to commit")
+		os.Exit(1)
 	}
 
 	// Step 1: Find container IDs via nerdctl (direct containerd API, no CRI dependency)
@@ -254,7 +320,7 @@ func main() {
 		}
 	}
 
-	if err := writeSnapshotResult(containerSpecs, digests); err != nil {
+	if err := writeSnapshotResult(containerSpecs, digests, skippedSpecs); err != nil {
 		fmt.Fprintf(os.Stderr, "WARNING: Failed to write snapshot result to termination message: %v\n", err)
 	}
 
@@ -262,9 +328,12 @@ func main() {
 	fmt.Printf("SNAPSHOT_DIGEST=%s\n", firstDigest)
 }
 
-func writeSnapshotResult(containerSpecs []ContainerSpec, digests map[string]string) error {
+func writeSnapshotResult(containerSpecs []ContainerSpec, digests map[string]string, skippedSpecs []ContainerSpec) error {
 	result := snapshotResult{
 		Containers: make([]snapshotContainerResult, 0, len(digests)),
+	}
+	for _, spec := range skippedSpecs {
+		result.Skipped = append(result.Skipped, spec.Name)
 	}
 	for _, spec := range containerSpecs {
 		digest, ok := digests[spec.Name]
@@ -293,7 +362,12 @@ func runUnpause(args []string) {
 
 	podName := args[0]
 	namespace := args[1]
-	containerNames := args[2:]
+	// Skipped containers were never paused by the commit job, and nerdctl
+	// unpause fails on a running container.
+	containerNames, skippedNames := partitionContainerNames(args[2:], skippedContainerNames())
+	for _, containerName := range skippedNames {
+		fmt.Printf("Skipping unpause for container '%s': it is never paused for a snapshot\n", containerName)
+	}
 	errors := 0
 
 	for _, containerName := range containerNames {

@@ -6,6 +6,13 @@ Concern: a snapshot is only ever restored from the container named `sandbox`,
 but `image-committer` commits and pushes every container it is given and fails
 the job on any push error.
 
+Landed: `kubernetes/cmd/image-committer` skips the containers a snapshot is
+never restored from (`egress`, `execd-installer`) in both the commit and the
+`unpause` path, and records them in the termination message.
+`SNAPSHOT_SKIP_CONTAINERS` overrides the list; an empty value restores
+upstream commit-everything behaviour. Drop this branch when upstream ships its
+own skip-or-tolerate.
+
 ## Rules for this branch
 
 - Do not merge or fast-forward upstream `main` into it.
