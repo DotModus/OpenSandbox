@@ -59,30 +59,50 @@ type ContainerSpec struct {
 	URI  string
 }
 
+// skipContainersEnv overrides the default skip list with a comma-separated
+// list of container names. An empty value commits every container.
+const skipContainersEnv = "SNAPSHOT_SKIP_CONTAINERS"
+
+// restoredContainerName is the container a snapshot is restored from. It is the
+// same name the lifecycle server selects a restore image by, so it can never be
+// skipped: the job would report success for a snapshot that cannot be restored,
+// and nothing downstream re-checks that a restore image was actually pushed.
+const restoredContainerName = "sandbox"
+
 // defaultSkippedContainers are the containers a sandbox snapshot never restores
-// from. Restore selects the container named "sandbox"; the egress sidecar and
-// the execd bootstrap init container are recreated from their own pinned images.
-// Committing them is wasted work, and the multi-arch egress sidecar cannot be
-// pushed at all - its reduced-platform commit has no content digest in the
-// registry - which fails the whole snapshot job.
+// from. The egress sidecar and the execd bootstrap init container are recreated
+// from their own pinned images. Committing them is wasted work, and the
+// multi-arch egress sidecar cannot be pushed at all - its reduced-platform
+// commit has no content digest in the registry - which fails the whole job.
 var defaultSkippedContainers = []string{"egress", "execd-installer"}
 
 // skippedContainerNames returns the containers this committer must not commit,
-// push, pause, or unpause. SNAPSHOT_SKIP_CONTAINERS overrides the default with
-// a comma-separated list; setting it to an empty value commits every container.
-func skippedContainerNames() map[string]bool {
+// push, pause, or unpause, and fails closed on a skip list that would drop the
+// restored container. Refusing here is deliberate: a rejected configuration is
+// visible, whereas one that is silently corrected is one somebody still
+// believes is in effect.
+func skippedContainerNames() (map[string]bool, error) {
 	names := defaultSkippedContainers
-	if raw, ok := os.LookupEnv("SNAPSHOT_SKIP_CONTAINERS"); ok {
+	if raw, ok := os.LookupEnv(skipContainersEnv); ok {
 		names = strings.Split(raw, ",")
 	}
 
 	skipped := make(map[string]bool, len(names))
 	for _, name := range names {
-		if trimmed := strings.TrimSpace(name); trimmed != "" {
-			skipped[trimmed] = true
+		trimmed := strings.TrimSpace(name)
+		if trimmed == "" {
+			continue
 		}
+		if trimmed == restoredContainerName {
+			return nil, fmt.Errorf(
+				"%s must not contain %q: a snapshot is restored from that container, so skipping it would report a snapshot that cannot be restored",
+				skipContainersEnv,
+				restoredContainerName,
+			)
+		}
+		skipped[trimmed] = true
 	}
-	return skipped
+	return skipped, nil
 }
 
 // partitionContainerSpecs splits parsed specs into the ones to snapshot and the
@@ -203,7 +223,12 @@ func main() {
 
 	// Drop the containers that are not part of the restorable snapshot before
 	// anything is paused, so a sidecar that cannot be pushed never fails the job.
-	containerSpecs, skippedSpecs := partitionContainerSpecs(containerSpecs, skippedContainerNames())
+	skipped, err := skippedContainerNames()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	containerSpecs, skippedSpecs := partitionContainerSpecs(containerSpecs, skipped)
 	for _, spec := range skippedSpecs {
 		fmt.Printf("Skipping container '%s': not restored from a snapshot image\n", spec.Name)
 	}
@@ -364,7 +389,12 @@ func runUnpause(args []string) {
 	namespace := args[1]
 	// Skipped containers were never paused by the commit job, and nerdctl
 	// unpause fails on a running container.
-	containerNames, skippedNames := partitionContainerNames(args[2:], skippedContainerNames())
+	skipped, err := skippedContainerNames()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+	containerNames, skippedNames := partitionContainerNames(args[2:], skipped)
 	for _, containerName := range skippedNames {
 		fmt.Printf("Skipping unpause for container '%s': it is never paused for a snapshot\n", containerName)
 	}

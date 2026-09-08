@@ -19,6 +19,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -241,12 +242,15 @@ func TestWriteSnapshotResultRecordsSkippedContainers(t *testing.T) {
 }
 
 func TestSkippedContainerNamesDefaultsToSidecarAndInit(t *testing.T) {
-	// t.Setenv registers the restore; Unsetenv then gives this test an
-	// a genuinely unset variable without leaking it into the rest of the package.
+	// t.Setenv registers the restore; Unsetenv then gives this test a
+	// genuinely unset variable without leaking it into the rest of the package.
 	t.Setenv("SNAPSHOT_SKIP_CONTAINERS", "")
 	os.Unsetenv("SNAPSHOT_SKIP_CONTAINERS")
 
-	skipped := skippedContainerNames()
+	skipped, err := skippedContainerNames()
+	if err != nil {
+		t.Fatalf("default skip list must be accepted, got %v", err)
+	}
 
 	if !skipped["egress"] {
 		t.Fatal("egress sidecar must be skipped by default")
@@ -262,7 +266,10 @@ func TestSkippedContainerNamesDefaultsToSidecarAndInit(t *testing.T) {
 func TestSkippedContainerNamesHonoursOverride(t *testing.T) {
 	t.Setenv("SNAPSHOT_SKIP_CONTAINERS", " proxy , , logger ")
 
-	skipped := skippedContainerNames()
+	skipped, err := skippedContainerNames()
+	if err != nil {
+		t.Fatalf("override must be accepted, got %v", err)
+	}
 
 	if len(skipped) != 2 || !skipped["proxy"] || !skipped["logger"] {
 		t.Fatalf("unexpected skip set %v", skipped)
@@ -275,8 +282,47 @@ func TestSkippedContainerNamesHonoursOverride(t *testing.T) {
 func TestSkippedContainerNamesEmptyOverrideCommitsEverything(t *testing.T) {
 	t.Setenv("SNAPSHOT_SKIP_CONTAINERS", "")
 
-	if skipped := skippedContainerNames(); len(skipped) != 0 {
+	skipped, err := skippedContainerNames()
+	if err != nil {
+		t.Fatalf("empty override must be accepted, got %v", err)
+	}
+	if len(skipped) != 0 {
 		t.Fatalf("empty override must commit every container, got %v", skipped)
+	}
+}
+
+func TestSkippedContainerNamesRefusesToSkipTheRestoredContainer(t *testing.T) {
+	// A snapshot is restored from this container and nothing downstream
+	// re-checks that its image was pushed, so skipping it would produce a
+	// snapshot that reports success and cannot be restored.
+	for _, value := range []string{
+		"sandbox",
+		"egress,sandbox",
+		" sandbox , egress ",
+	} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("SNAPSHOT_SKIP_CONTAINERS", value)
+
+			skipped, err := skippedContainerNames()
+
+			if err == nil {
+				t.Fatal("skipping the restored container must be refused")
+			}
+			if skipped != nil {
+				t.Fatalf("expected no skip set on refusal, got %v", skipped)
+			}
+			if !strings.Contains(err.Error(), "sandbox") {
+				t.Fatalf("error must name the container, got %q", err)
+			}
+		})
+	}
+}
+
+func TestDefaultSkipListNeverContainsTheRestoredContainer(t *testing.T) {
+	for _, name := range defaultSkippedContainers {
+		if name == restoredContainerName {
+			t.Fatalf("default skip list must never contain %q", restoredContainerName)
+		}
 	}
 }
 
@@ -287,7 +333,12 @@ func TestPartitionContainerSpecsKeepsSandboxAndSkipsSidecars(t *testing.T) {
 		{Name: "execd-installer", URI: "registry.example.com/execd:snap"},
 	}
 
-	commit, skip := partitionContainerSpecs(specs, skippedContainerNames())
+	skipped, err := skippedContainerNames()
+	if err != nil {
+		t.Fatalf("default skip list must be accepted, got %v", err)
+	}
+
+	commit, skip := partitionContainerSpecs(specs, skipped)
 
 	if len(commit) != 1 || commit[0].Name != "sandbox" {
 		t.Fatalf("expected only the sandbox container to be committed, got %#v", commit)
@@ -298,10 +349,12 @@ func TestPartitionContainerSpecsKeepsSandboxAndSkipsSidecars(t *testing.T) {
 }
 
 func TestPartitionContainerNamesSkipsSidecarsForUnpause(t *testing.T) {
-	keep, skip := partitionContainerNames(
-		[]string{"sandbox", "egress"},
-		skippedContainerNames(),
-	)
+	skipped, err := skippedContainerNames()
+	if err != nil {
+		t.Fatalf("default skip list must be accepted, got %v", err)
+	}
+
+	keep, skip := partitionContainerNames([]string{"sandbox", "egress"}, skipped)
 
 	if len(keep) != 1 || keep[0] != "sandbox" {
 		t.Fatalf("expected only the sandbox container to be unpaused, got %v", keep)

@@ -10,8 +10,10 @@ Landed: `kubernetes/cmd/image-committer` skips the containers a snapshot is
 never restored from (`egress`, `execd-installer`) in both the commit and the
 `unpause` path, and records them in the termination message.
 `SNAPSHOT_SKIP_CONTAINERS` overrides the list; an empty value restores
-upstream commit-everything behaviour. Drop this branch when upstream ships its
-own skip-or-tolerate.
+upstream commit-everything behaviour. The list may never contain `sandbox` —
+that is the container a snapshot is restored from, and the committer fails
+closed rather than produce a snapshot that reports success and cannot be
+restored. Drop this branch when upstream ships its own skip-or-tolerate.
 
 ## Rules for this branch
 
