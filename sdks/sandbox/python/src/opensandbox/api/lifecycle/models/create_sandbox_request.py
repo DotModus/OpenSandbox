@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from ..models.network_policy import NetworkPolicy
     from ..models.platform_spec import PlatformSpec
     from ..models.resource_limits import ResourceLimits
+    from ..models.sandbox_lifecycle import SandboxLifecycle
     from ..models.volume import Volume
 
 
@@ -52,8 +53,11 @@ class CreateSandboxRequest:
     sandbox entrypoint to `["tail", "-f", "/dev/null"]`.
 
     **Pool mode**: When `extensions.poolRef` is set, the sandbox is created from
-    a pre-configured pool. In this case `image`, `entrypoint`, and
-    `resourceLimits` are all optional (defined by the Pool CRD template).
+    a pre-configured on-demand Pool. In this case `image` and `resourceLimits`
+    are optional and defined by the Pool CRD template. `entrypoint` is also
+    optional; when omitted, the server creates a per-allocation task using
+    `['tail', '-f', '/dev/null']`. The Pool must run task-executor and provide
+    bootstrap plus execd.
     `snapshotId`, `networkPolicy`, `platform`, `volumes`, and
     `credentialProxy.enabled` must not be provided together with `poolRef`.
 
@@ -108,12 +112,20 @@ class CreateSandboxRequest:
                 Use "name" key for a human-readable identifier.
                  Example: {'name': 'Data Processing Sandbox', 'project': 'data-processing', 'team': 'ml', 'environment':
                 'staging'}.
+            lifecycle (SandboxLifecycle | Unset): Extensible container for sandbox lifecycle hooks. All fields are optional.
+                Future lifecycle events are added as new optional fields without changing
+                the semantics of existing fields.
+
+                This release supports only `preStart` and `periodic`.
             entrypoint (list[str] | Unset): The command to execute as the sandbox's entry process.
 
                 Required when `image` is provided.
 
                 Optional when `snapshotId` is provided. If omitted for snapshot
                 restore, the server defaults to `["tail", "-f", "/dev/null"]`.
+
+                Optional when `extensions.poolRef` is provided. If omitted for Pool
+                mode, the server uses the same default in a per-allocation task.
 
                 Explicitly specifies the user's expected main process, allowing the sandbox management
                 service to reliably inject control processes before executing this command.
@@ -173,6 +185,7 @@ class CreateSandboxRequest:
     resource_requests: ResourceLimits | Unset = UNSET
     env: CreateSandboxRequestEnv | Unset = UNSET
     metadata: CreateSandboxRequestMetadata | Unset = UNSET
+    lifecycle: SandboxLifecycle | Unset = UNSET
     entrypoint: list[str] | Unset = UNSET
     network_policy: NetworkPolicy | Unset = UNSET
     credential_proxy: CredentialProxyConfig | Unset = UNSET
@@ -213,6 +226,10 @@ class CreateSandboxRequest:
         metadata: dict[str, Any] | Unset = UNSET
         if not isinstance(self.metadata, Unset):
             metadata = self.metadata.to_dict()
+
+        lifecycle: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.lifecycle, Unset):
+            lifecycle = self.lifecycle.to_dict()
 
         entrypoint: list[str] | Unset = UNSET
         if not isinstance(self.entrypoint, Unset):
@@ -258,6 +275,8 @@ class CreateSandboxRequest:
             field_dict["env"] = env
         if metadata is not UNSET:
             field_dict["metadata"] = metadata
+        if lifecycle is not UNSET:
+            field_dict["lifecycle"] = lifecycle
         if entrypoint is not UNSET:
             field_dict["entrypoint"] = entrypoint
         if network_policy is not UNSET:
@@ -283,6 +302,7 @@ class CreateSandboxRequest:
         from ..models.network_policy import NetworkPolicy
         from ..models.platform_spec import PlatformSpec
         from ..models.resource_limits import ResourceLimits
+        from ..models.sandbox_lifecycle import SandboxLifecycle
         from ..models.volume import Volume
 
         d = dict(src_dict)
@@ -339,6 +359,13 @@ class CreateSandboxRequest:
         else:
             metadata = CreateSandboxRequestMetadata.from_dict(_metadata)
 
+        _lifecycle = d.pop("lifecycle", UNSET)
+        lifecycle: SandboxLifecycle | Unset
+        if isinstance(_lifecycle, Unset):
+            lifecycle = UNSET
+        else:
+            lifecycle = SandboxLifecycle.from_dict(_lifecycle)
+
         entrypoint = cast(list[str], d.pop("entrypoint", UNSET))
 
         _network_policy = d.pop("networkPolicy", UNSET)
@@ -382,6 +409,7 @@ class CreateSandboxRequest:
             resource_requests=resource_requests,
             env=env,
             metadata=metadata,
+            lifecycle=lifecycle,
             entrypoint=entrypoint,
             network_policy=network_policy,
             credential_proxy=credential_proxy,

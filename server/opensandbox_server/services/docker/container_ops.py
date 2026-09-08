@@ -307,12 +307,16 @@ class DockerContainerOpsMixin:
         apply_access_renew_extend_seconds_to_mapping(labels, request.extensions)
         apply_extensions_to_mapping(labels, request.extensions)
 
-        env_dict = request.env or {}
+        # Config-level defaults apply to every sandbox; request keys win.
+        env_dict = {**(self.app_config.docker.sandbox_env or {}), **(request.env or {})}
         environment = []
         for key, value in env_dict.items():
             if value is None:
                 continue
             environment.append(f"{key}={value}")
+        if self.app_config and self.app_config.runtime.execd_run_as_init:
+            environment.append("EXECD_INIT=1")
+        environment.append(f"OPENSANDBOX_ID={sandbox_id}")
         return labels, environment
 
     def _resolve_image_auth(
@@ -332,10 +336,34 @@ class DockerContainerOpsMixin:
         self, request: CreateSandboxRequest
     ) -> tuple[Optional[int], Optional[int], Optional[int]]:
         resource_limits = (request.resource_limits.root if request.resource_limits else None) or {}
-        mem_limit = parse_memory_limit(resource_limits.get("memory"))
-        nano_cpus = parse_nano_cpus(resource_limits.get("cpu"))
-        gpu_count = parse_gpu_request(resource_limits.get("gpu"))
-        return mem_limit, nano_cpus, gpu_count
+        resolved: dict[str, Optional[int]] = {}
+        for key, parser in (
+            ("memory", parse_memory_limit),
+            ("cpu", parse_nano_cpus),
+            ("gpu", parse_gpu_request),
+        ):
+            if key not in resource_limits:
+                resolved[key] = None
+                continue
+            value = resource_limits[key]
+            try:
+                parsed = parser(value)
+            except ValueError:
+                parsed = None
+            if parsed is None or (parsed <= 0 and not (key == "gpu" and parsed == -1)):
+                value_preview = repr(value[:80])
+                if len(value) > 80:
+                    value_preview += f"... ({len(value)} characters)"
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_PARAMETER,
+                        "message": f"Invalid resourceLimits.{key}: {value_preview}; must resolve to a "
+                        + ("positive device count or 'all'." if key == "gpu" else "positive resource limit."),
+                    },
+                )
+            resolved[key] = parsed
+        return resolved["memory"], resolved["cpu"], resolved["gpu"]
 
     def _base_host_config_kwargs(
         self,
@@ -359,11 +387,11 @@ class DockerContainerOpsMixin:
             host_config_kwargs["cap_drop"] = docker_cfg.drop_capabilities
         if docker_cfg.pids_limit is not None:
             host_config_kwargs["pids_limit"] = docker_cfg.pids_limit
-        if mem_limit:
+        if mem_limit is not None:
             host_config_kwargs["mem_limit"] = mem_limit
-        if nano_cpus:
+        if nano_cpus is not None:
             host_config_kwargs["nano_cpus"] = nano_cpus
-        if gpu_count:
+        if gpu_count is not None:
             # Honors host toolchains such as nvidia-container-toolkit. The Docker
             # Engine returns a clear error at container create time if the host
             # cannot satisfy the request, so failure is surfaced rather than silent.

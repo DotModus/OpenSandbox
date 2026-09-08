@@ -20,6 +20,28 @@ from opensandbox_server.api import lifecycle
 from opensandbox_server.api.schema import CreateSandboxResponse, SandboxStatus
 
 
+def test_create_sandbox_openapi_describes_synchronous_provisioning(
+    client: TestClient,
+) -> None:
+    response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    create_response = response.json()["paths"]["/v1/sandboxes"]["post"]["responses"]["202"]
+    assert create_response["description"] == "Sandbox created and provisioned successfully"
+
+
+def test_create_sandbox_openapi_declares_quota_rejection_403(
+    client: TestClient,
+) -> None:
+    response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    responses = response.json()["paths"]["/v1/sandboxes"]["post"]["responses"]
+    quota_response = responses["403"]
+    assert quota_response["description"].startswith("Namespace ResourceQuota exhausted")
+    assert quota_response["content"]["application/json"]["schema"]["$ref"].endswith("ErrorResponse")
+
+
 def test_create_sandbox_returns_202_and_service_payload(
     client: TestClient,
     auth_headers: dict,

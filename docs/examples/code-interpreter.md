@@ -38,7 +38,7 @@ uv pip install opensandbox opensandbox-code-interpreter
 uv run python examples/code-interpreter/main.py
 ```
 
-The script creates a Sandbox + CodeInterpreter, runs a Python code snippet and prints stdout/result, then terminates the remote instance.
+The script creates a Sandbox + CodeInterpreter, runs a Python code snippet and prints stdout/result, then terminates the remote instance. Cleanup is attempted in a `finally` block even if interpreter setup or code execution raises an exception.
 
 ## Environment variables
 
@@ -112,7 +112,7 @@ spec:
             - name: opensandbox-bin
               mountPath: /opt/opensandbox
         - name: execd-installer
-          image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.0.22
+          image: sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.1.0
           command: [ "/bin/sh", "-c" ]
           args:
             - |

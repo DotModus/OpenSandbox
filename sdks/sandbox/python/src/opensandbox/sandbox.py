@@ -44,6 +44,7 @@ from opensandbox.models.sandboxes import (
     SandboxEndpoint,
     SandboxImageSpec,
     SandboxInfo,
+    SandboxLifecycle,
     SandboxMetrics,
     SandboxRenewResponse,
     SnapshotInfo,
@@ -446,11 +447,11 @@ class Sandbox:
             f"Waiting for sandbox {self.id} to pass health check (timeout: {timeout.total_seconds()}s)"
         )
 
-        deadline = time.time() + timeout.total_seconds()
+        deadline = time.monotonic() + timeout.total_seconds()
         attempt = 0
         last_exception: Exception | None = None
 
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             attempt += 1
             logger.debug(f"Health check attempt #{attempt} for sandbox {self.id}")
 
@@ -471,7 +472,10 @@ class Sandbox:
                 )
 
             if not is_healthy:
-                await asyncio.sleep(polling_interval.total_seconds())
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(polling_interval.total_seconds(), remaining))
 
         error_detail = (
             f"Last error: {last_exception}"
@@ -513,6 +517,7 @@ class Sandbox:
         health_check: Callable[["Sandbox"], Awaitable[bool]] | None = None,
         health_check_polling_interval: timedelta = timedelta(milliseconds=200),
         skip_health_check: bool = False,
+        lifecycle: SandboxLifecycle | None = None,
     ) -> "Sandbox":
         """
         Create a new sandbox instance with the specified configuration.
@@ -536,6 +541,7 @@ class Sandbox:
             health_check: Custom async health check function
             health_check_polling_interval: Time between health check attempts
             skip_health_check: If True, do NOT wait for sandbox readiness/health; returned instance may not be ready yet.
+            lifecycle: Optional pre-start and periodic lifecycle hooks.
 
         Returns:
             Fully configured and ready Sandbox instance
@@ -587,14 +593,17 @@ class Sandbox:
                 secure_access=secure_access,
                 snapshot_id=snapshot_id,
                 resource_requests=resource_requests,
+                lifecycle=lifecycle,
             )
             sandbox_id = response.id
 
-            execd_endpoint = await sandbox_service.get_sandbox_endpoint(
-                response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
-            )
-            egress_endpoint = await sandbox_service.get_sandbox_endpoint(
-                response.id, DEFAULT_EGRESS_PORT, config.use_server_proxy
+            execd_endpoint, egress_endpoint = await asyncio.gather(
+                sandbox_service.get_sandbox_endpoint(
+                    response.id, DEFAULT_EXECD_PORT, config.use_server_proxy
+                ),
+                sandbox_service.get_sandbox_endpoint(
+                    response.id, DEFAULT_EGRESS_PORT, config.use_server_proxy
+                ),
             )
 
             sandbox = cls(
@@ -702,11 +711,13 @@ class Sandbox:
 
         try:
             sandbox_service = factory.create_sandbox_service()
-            execd_endpoint = await sandbox_service.get_sandbox_endpoint(
-                sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
-            )
-            egress_endpoint = await sandbox_service.get_sandbox_endpoint(
-                sandbox_id, DEFAULT_EGRESS_PORT, config.use_server_proxy
+            execd_endpoint, egress_endpoint = await asyncio.gather(
+                sandbox_service.get_sandbox_endpoint(
+                    sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
+                ),
+                sandbox_service.get_sandbox_endpoint(
+                    sandbox_id, DEFAULT_EGRESS_PORT, config.use_server_proxy
+                ),
             )
 
             sandbox = cls(
@@ -782,11 +793,13 @@ class Sandbox:
             sandbox_service = factory.create_sandbox_service()
             await sandbox_service.resume_sandbox(sandbox_id)
 
-            execd_endpoint = await sandbox_service.get_sandbox_endpoint(
-                sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
-            )
-            egress_endpoint = await sandbox_service.get_sandbox_endpoint(
-                sandbox_id, DEFAULT_EGRESS_PORT, config.use_server_proxy
+            execd_endpoint, egress_endpoint = await asyncio.gather(
+                sandbox_service.get_sandbox_endpoint(
+                    sandbox_id, DEFAULT_EXECD_PORT, config.use_server_proxy
+                ),
+                sandbox_service.get_sandbox_endpoint(
+                    sandbox_id, DEFAULT_EGRESS_PORT, config.use_server_proxy
+                ),
             )
 
             sandbox = cls(
