@@ -103,6 +103,8 @@ Pausing persists the rootfs, pushes it to the configured registry, and releases 
 
 ![Pause/resume phases](../../public/images/operator-pause-phases.svg)
 
+Set `--snapshot-image-uri-template` (Helm: `controller.snapshot.imageURITemplate`) to customize snapshot image names before the initial push. An empty template preserves the default naming rule; see [custom image names](/guides/pause-resume#custom-image-names) for the named fields and date/timezone formatting helpers.
+
 ## Reading status
 
 The phase reports sandbox runtime health; the conditions explain it. Both are Kubernetes-native and inspectable with plain `kubectl`.
