@@ -1,0 +1,8 @@
+# Risk acceptance for current Python runtime scan findings.
+# Review date: 2026-12-31
+
+# anyio 4.13.0 (Python)
+CVE-2026-63374
+
+# jupyter_server 2.19.0 (Python)
+CVE-2026-86049
