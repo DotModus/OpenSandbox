@@ -186,7 +186,7 @@ def run_ext_http():
         time.sleep(3600)
 
 
-def run_connect_proxy():
+def run_connect_proxy(listener: socket.socket | None = None):
     # Raw-socket relay (not http.server): the CONNECT tunnel must see every
     # byte after the request head, and BaseHTTPRequestHandler's buffered
     # reader can swallow post-head bytes into its lookahead.
@@ -221,14 +221,19 @@ def run_connect_proxy():
         if head is None:
             conn.close()
             return
-        method, _, target = head.split(b"\r\n", 1)[0].decode("latin-1").partition(" ")
+        try:
+            method, target, _version = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ", 2)
+        except ValueError:
+            conn.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            conn.close()
+            return
         leftover = head.split(b"\r\n\r\n", 1)[1]
 
         if method == "CONNECT":
             host, _, port = target.partition(":")
             try:
                 upstream = socket.create_connection((host, int(port or "443")), timeout=10)
-            except OSError:
+            except (OSError, ValueError):
                 conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 conn.close()
                 return
@@ -249,7 +254,7 @@ def run_connect_proxy():
             parts = urlsplit(target)
             try:
                 upstream = socket.create_connection((parts.hostname, parts.port or 80), timeout=10)
-            except OSError:
+            except (OSError, ValueError):
                 conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
                 conn.close()
                 return
@@ -284,10 +289,12 @@ def run_connect_proxy():
         )
         conn.close()
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", CONNECT_PROXY_PORT))
-    srv.listen(64)
+    srv = listener
+    if srv is None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("0.0.0.0", CONNECT_PROXY_PORT))
+        srv.listen(64)
     while True:
         conn, _ = srv.accept()
         threading.Thread(target=handle, args=(conn,), daemon=True).start()

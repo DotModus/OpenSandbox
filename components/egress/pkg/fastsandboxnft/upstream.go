@@ -148,40 +148,45 @@ func (a *Applier) AddUpstreamProxyIPs(ctx context.Context, ips []nftables.Resolv
 		return err
 	}
 	for _, addr := range learned {
-		a.upstreamIPs[addr] = struct{}{}
+		a.upstreamIPs[addr] = 0
 	}
 	telemetry.RecordNftablesUpdate()
 	return nil
 }
 
-// SyncUpstreamProxyIPs makes the drop sets match ips exactly: new addresses
-// are added (permanent elements) and addresses no longer returned are
-// removed — this is the expiry mechanism for the containment, replacing
-// kernel timeouts. A failed or empty resolve must never reach this prune:
-// stale addresses only leave the sets when a SUCCESSFUL resolve stopped
-// returning them (fail-closed retention — extra elements are safe, missing
-// ones are not). The mirror is committed only after a successful apply.
+// SyncUpstreamProxyIPs adds new addresses permanently and removes addresses
+// absent from two successful full-authority refreshes. AddUpstreamProxyIPs
+// resets the absence count, protecting addresses learned during a lookup
+// from its stale snapshot. Failed, partial or empty resolves must never
+// reach this prune. The mirror and absence counts are committed only after
+// a successful apply, under the same lock as DNS learning and table rebuilds.
 // No-op (nil) when no upstream proxy is configured.
 func (a *Applier) SyncUpstreamProxyIPs(ctx context.Context, ips []nftables.ResolvedIP) error {
 	if a.opts.UpstreamProxy == nil {
 		return nil
 	}
-	desired := make(map[netip.Addr]struct{}, len(ips))
+	desired := make(map[netip.Addr]uint8, len(ips))
 	for _, r := range ips {
 		addr := r.Addr.Unmap()
 		if upstreamProxySetFor(addr) == "" {
 			continue
 		}
-		desired[addr] = struct{}{}
+		desired[addr] = 0
 	}
 	if len(desired) == 0 {
 		// Never a legitimate "remove everything": a non-empty answer whose
 		// entries are all unusable is a failure, not a rotation to nothing.
 		return fmt.Errorf("no usable addresses among %d resolved entries", len(ips))
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	var script strings.Builder
-	for addr := range a.upstreamIPs {
+	for addr, missed := range a.upstreamIPs {
 		if _, keep := desired[addr]; keep {
+			continue
+		}
+		if missed == 0 {
+			desired[addr] = 1
 			continue
 		}
 		set := upstreamProxySetFor(addr)
@@ -193,10 +198,8 @@ func (a *Applier) SyncUpstreamProxyIPs(ctx context.Context, ips []nftables.Resol
 	for addr := range desired {
 		writeUpstreamElement(&script, upstreamProxySetFor(addr), addr)
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
 	if _, err := a.run(ctx, script.String()); err != nil {
-		telemetry.RecordNftablesUpdateFailed(telemetry.NftOpUpstreamProxyAdd)
+		telemetry.RecordNftablesUpdateFailed(telemetry.NftOpUpstreamProxySync)
 		return err
 	}
 	a.upstreamIPs = desired
@@ -223,56 +226,77 @@ const (
 	upstreamProxySeedBackoffMax = 10 * time.Second
 )
 
-// StartUpstreamProxyRefresh re-resolves the upstream proxy hostname through
-// lookup and syncs the answers into the drop sets, so they stay seeded even
-// when no sandbox ever queries the name: sandbox lookups add elements
-// through the dnsproxy infra-domain callback, but nothing guarantees such
-// queries.
-//
-// The FIRST sync is fail closed: it retries with bounded backoff until the
-// drop set is seeded and returns an error when the seed deadline passes —
-// the caller fails startup rather than serving with unseeded containment
-// (a sandbox only needs the proxy IP, obtainable out-of-band, to relay).
-// Later ticks are best-effort by design: elements are permanent, so a
-// failed tick cannot lapse existing containment — it only delays picking
-// up rotation, and while both resolver authorities fail equally the shared
-// mitmproxy cannot dial the new addresses either. Literal endpoints need
-// no loop (their elements are permanent and come from Options).
-func (a *Applier) StartUpstreamProxyRefresh(ctx context.Context, domain string, lookup func(context.Context, string) ([]nftables.ResolvedIP, error)) error {
-	sync := func() error {
-		syncCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-		ips, err := lookup(syncCtx, domain)
-		if err != nil {
-			return err
-		}
-		if len(ips) == 0 {
-			return fmt.Errorf("resolved to no addresses")
-		}
-		return a.SyncUpstreamProxyIPs(syncCtx, ips)
-	}
-	deadline := a.now().Add(a.upstreamSeedTimeout)
+// SeedUpstreamProxyIPs resolves before ApplyReset without touching the kernel.
+// A failed seed leaves the previous generation's containment intact. A
+// successful seed is installed atomically with the reset, never afterwards.
+// A partial-authority answer is insufficient for startup.
+func (a *Applier) SeedUpstreamProxyIPs(ctx context.Context, domain string, lookup func(context.Context, string) ([]nftables.ResolvedIP, error)) error {
+	seedCtx, cancel := context.WithTimeout(ctx, a.upstreamSeedTimeout)
+	defer cancel()
 	backoff := min(upstreamProxySeedBackoffMin, a.upstreamSeedTimeout/8)
 	maxBackoff := min(upstreamProxySeedBackoffMax, a.upstreamSeedTimeout/2)
 	for {
-		err := sync()
+		lookupCtx, lookupCancel := context.WithTimeout(seedCtx, 5*time.Second)
+		ips, err := lookup(lookupCtx, domain)
+		lookupCancel()
+		seed := make(map[netip.Addr]uint8, len(ips))
+		for _, ip := range ips {
+			addr := ip.Addr.Unmap()
+			if upstreamProxySetFor(addr) != "" {
+				seed[addr] = 0
+			}
+		}
+		if err == nil && len(seed) == 0 {
+			err = fmt.Errorf("resolved to no addresses")
+		}
 		if err == nil {
-			break
+			if err := seedCtx.Err(); err != nil {
+				return fmt.Errorf("containment seed failed: %w", err)
+			}
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			if a.tableReady {
+				return fmt.Errorf("containment must be seeded before the table reset")
+			}
+			a.upstreamIPs = seed
+			return nil
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if !a.now().Before(deadline) {
+		if seedCtx.Err() != nil {
 			return fmt.Errorf("containment seed failed: %w", err)
 		}
 		log.Warnf("fastsandboxnft: upstream proxy seed for %q failed (retrying): %v", domain, err)
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-seedCtx.Done():
+			return fmt.Errorf("containment seed failed: %w", err)
 		case <-time.After(backoff):
 		}
 		backoff = min(backoff*2, maxBackoff)
 	}
+}
+
+// refreshUpstreamProxyIPs gives nft its own deadline after DNS completes.
+// Partial answers can add containment, but must never prune the mirror.
+func (a *Applier) refreshUpstreamProxyIPs(ctx context.Context, domain string, lookup func(context.Context, string) ([]nftables.ResolvedIP, error)) error {
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ips, lookupErr := lookup(lookupCtx, domain)
+	cancel()
+	applyCtx, applyCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer applyCancel()
+	if lookupErr != nil {
+		if err := a.AddUpstreamProxyIPs(applyCtx, ips); err != nil {
+			return fmt.Errorf("partial resolution: %v; adding addresses: %w", lookupErr, err)
+		}
+		return lookupErr
+	}
+	return a.SyncUpstreamProxyIPs(applyCtx, ips)
+}
+
+// StartUpstreamProxyRefresh starts periodic refreshes after the seeded reset.
+// Literal endpoints need no loop. Failed ticks retain existing containment.
+func (a *Applier) StartUpstreamProxyRefresh(ctx context.Context, domain string, lookup func(context.Context, string) ([]nftables.ResolvedIP, error)) {
 	safego.Go(func() {
 		ticker := time.NewTicker(upstreamProxyRefreshInterval)
 		defer ticker.Stop()
@@ -281,11 +305,10 @@ func (a *Applier) StartUpstreamProxyRefresh(ctx context.Context, domain string, 
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := sync(); err != nil {
+				if err := a.refreshUpstreamProxyIPs(ctx, domain, lookup); err != nil {
 					log.Warnf("fastsandboxnft: upstream proxy refresh for %q failed (elements retained): %v", domain, err)
 				}
 			}
 		}
 	})
-	return nil
 }

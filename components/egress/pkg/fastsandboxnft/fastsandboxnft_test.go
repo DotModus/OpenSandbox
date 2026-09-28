@@ -568,8 +568,8 @@ func TestUpstreamProxyForwardDrops(t *testing.T) {
 	runner := &fakeRunner{}
 	a := NewApplier(runner.Run, Options{
 		UpstreamProxy: &UpstreamProxyEndpoint{
-			Port:        3128,
-			LiteralIPs:  []netip.Addr{netip.MustParseAddr("10.1.2.3"), netip.MustParseAddr("2001:db8::1")},
+			Port:       3128,
+			LiteralIPs: []netip.Addr{netip.MustParseAddr("10.1.2.3"), netip.MustParseAddr("2001:db8::1")},
 		},
 	})
 	s := subject.FromSandboxUID("u-1")
@@ -693,7 +693,11 @@ func TestSyncUpstreamProxyIPs(t *testing.T) {
 	require.NoError(t, a.ApplyReset(ctx))
 	require.NoError(t, a.AddUpstreamProxyIPs(ctx, []nftables.ResolvedIP{{Addr: netip.MustParseAddr("10.9.9.9")}}))
 
-	// rotation: 10.9.9.9 out, 10.8.8.8 in
+	// One missing snapshot must retain the address, including across rebuilds.
+	require.NoError(t, a.SyncUpstreamProxyIPs(ctx, []nftables.ResolvedIP{{Addr: netip.MustParseAddr("10.8.8.8")}}))
+	require.NoError(t, a.ApplyReset(ctx))
+	require.Contains(t, runner.last(), "add element inet opensandbox-fast-sandbox upstream_proxy_v4 { 10.9.9.9 }")
+	// A second successful full refresh confirms rotation.
 	require.NoError(t, a.SyncUpstreamProxyIPs(ctx, []nftables.ResolvedIP{{Addr: netip.MustParseAddr("10.8.8.8")}}))
 	script := runner.last()
 	require.Contains(t, script, "delete element inet opensandbox-fast-sandbox upstream_proxy_v4 { 10.9.9.9 }")
@@ -732,11 +736,11 @@ func TestSyncUpstreamProxyIPs(t *testing.T) {
 	require.NoError(t, c.SyncUpstreamProxyIPs(ctx, []nftables.ResolvedIP{{Addr: netip.MustParseAddr("10.8.8.8")}}))
 }
 
-// TestStartUpstreamProxyRefreshSeedFailClosed: the first seed retries with
+// TestSeedUpstreamProxyIPsFailClosed: the first seed retries with
 // bounded backoff and returns an error when the hostname cannot be
 // resolved — the caller fails startup instead of serving sandboxes with an
 // empty drop set.
-func TestStartUpstreamProxyRefreshSeedFailClosed(t *testing.T) {
+func TestSeedUpstreamProxyIPsFailClosed(t *testing.T) {
 	runner := &fakeRunner{}
 	a := NewApplier(runner.Run, Options{UpstreamProxy: &UpstreamProxyEndpoint{Port: 3128}})
 	a.upstreamSeedTimeout = 80 * time.Millisecond
@@ -744,14 +748,14 @@ func TestStartUpstreamProxyRefreshSeedFailClosed(t *testing.T) {
 	defer cancel()
 
 	// persistent lookup failure: seed retries, then errors with the cause
-	err := a.StartUpstreamProxyRefresh(ctx, "proxy.test", func(context.Context, string) ([]nftables.ResolvedIP, error) {
+	err := a.SeedUpstreamProxyIPs(ctx, "proxy.test", func(context.Context, string) ([]nftables.ResolvedIP, error) {
 		return nil, fmt.Errorf("dns down")
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "dns down")
 
 	// NXDOMAIN-everywhere is equally fatal for the first seed
-	err = a.StartUpstreamProxyRefresh(ctx, "proxy.test", func(context.Context, string) ([]nftables.ResolvedIP, error) {
+	err = a.SeedUpstreamProxyIPs(ctx, "proxy.test", func(context.Context, string) ([]nftables.ResolvedIP, error) {
 		return nil, nil
 	})
 	require.Error(t, err)
@@ -761,18 +765,19 @@ func TestStartUpstreamProxyRefreshSeedFailClosed(t *testing.T) {
 	require.Equal(t, 0, runner.count())
 }
 
-// TestStartUpstreamProxyRefreshSeeds: a resolvable hostname seeds the drop
-// set synchronously (before the caller starts serving) as permanent
-// elements.
-func TestStartUpstreamProxyRefreshSeeds(t *testing.T) {
+// The seed does not modify the kernel; the first reset includes containment.
+func TestSeedUpstreamProxyIPsBeforeReset(t *testing.T) {
 	runner := &fakeRunner{}
 	a := NewApplier(runner.Run, Options{UpstreamProxy: &UpstreamProxyEndpoint{Port: 3128}})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	require.NoError(t, a.StartUpstreamProxyRefresh(ctx, "proxy.test", func(context.Context, string) ([]nftables.ResolvedIP, error) {
+	require.NoError(t, a.SeedUpstreamProxyIPs(ctx, "proxy.test", func(context.Context, string) ([]nftables.ResolvedIP, error) {
 		return []nftables.ResolvedIP{{Addr: netip.MustParseAddr("10.9.9.9"), TTL: time.Minute}}, nil
 	}))
+	require.Zero(t, runner.count(), "resolution must leave the previous kernel table untouched")
+	require.NoError(t, a.ApplyReset(ctx))
+	require.Equal(t, 1, runner.count(), "the first transaction must already contain the seed")
 	script := runner.last()
 	require.Contains(t, script, "add element inet opensandbox-fast-sandbox upstream_proxy_v4 { 10.9.9.9 }")
 	assert.NotContains(t, script, "10.9.9.9 timeout", "seeded elements must be permanent")

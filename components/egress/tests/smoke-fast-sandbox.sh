@@ -677,7 +677,8 @@ else
 
   HOSTS_BACKUP="$(mktemp /tmp/fast-sandbox-hosts.XXXXXX)"
   cp /etc/hosts "${HOSTS_BACKUP}"
-  echo "10.99.0.2 proxy.test" >> /etc/hosts
+  # osb-ext shares this hosts file: the relay must resolve absolute-URI hosts.
+  echo "10.99.0.2 proxy.test ext.test" >> /etc/hosts
 
   kill "${EGRESS_PID}" 2>/dev/null
   wait "${EGRESS_PID}" 2>/dev/null || true
@@ -706,14 +707,14 @@ else
   out="$(ip netns exec osb-sandbox-a curl -s -m 8 -H 'Host: ext.test' http://10.99.0.2/)"
   echo "${out}" | grep -qi "x-api-key: chain-v1" || fail "chained http lost mitm credential injection; got: ${out}"
   after="$(relay_count)"
-  [ "${after}" -gt "${before}" ] || fail "chained http must traverse the CONNECT relay (count ${before} -> ${after})"
+  [ "${after}" -gt "${before}" ] || fail "chained http must traverse the forward relay (count ${before} -> ${after})"
   out="$(ip netns exec osb-sandbox-a curl -sk -m 8 -H 'Host: ext.test' https://10.99.0.2/)"
   echo "${out}" | grep -qi "x-api-key: chain-v1" || fail "chained https lost mitm credential injection; got: ${out}"
   [ "$(relay_count)" -gt "${after}" ] || fail "chained https must traverse the CONNECT tunnel"
   pass "chained data plane (sandbox -> mitm -> CONNECT relay -> ext, http + https)"
 
   # Direct sandbox -> proxy is dropped for a policy-scoped subject.
-  if ip netns exec osb-sandbox-a curl -s -m 3 -o /dev/null -x http://10.99.0.2:3128 http://10.99.0.2:8080/ 2>/dev/null; then
+  if ip netns exec osb-sandbox-a curl -s -m 3 -o /dev/null --proxytunnel -x http://10.99.0.2:3128 http://10.99.0.2:8080/ 2>/dev/null; then
     fail "direct sandbox CONNECT to the chained proxy must be dropped"
   fi
   pass "direct proxy CONNECT dropped (policy-scoped subject)"
@@ -725,7 +726,7 @@ else
   lifecycle_hook a runtime-a-2 att-a-2 sandbox.data-plane-ready
   out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2:8080/)"
   echo "${out}" | grep -qi "client=10.10.0.5" || fail "default-allow control request failed (subject inactive?); got: ${out}"
-  if ip netns exec osb-sandbox-a curl -s -m 3 -o /dev/null -x http://10.99.0.2:3128 http://10.99.0.2:8080/ 2>/dev/null; then
+  if ip netns exec osb-sandbox-a curl -s -m 3 -o /dev/null --proxytunnel -x http://10.99.0.2:3128 http://10.99.0.2:8080/ 2>/dev/null; then
     fail "default-allow subject must NOT reach the chained proxy (open-relay bypass)"
   fi
   pass "profile-wide containment (default-allow subject still blocked)"
@@ -744,7 +745,7 @@ else
     "nft list set inet opensandbox-fast-sandbox upstream_proxy_v4 2>/dev/null | grep -q '10.99.0.2'"
   bind_and_ready a 10.10.0.5 12 runtime-a-2 att-a-2 '{"defaultAction":"deny","egress":[{"action":"allow","target":"10.99.0.2"},{"action":"allow","target":"ext.test"}]}'
   push_vault a '{"credentials":[{"name":"k","source":{"type":"inline","value":"chain-v1"}}],"bindings":[{"name":"b","match":{"schemes":["http","https"],"hosts":["ext.test"]},"auth":{"type":"apiKey","name":"X-Api-Key","credential":"k"}}]}'
-  if ip netns exec osb-sandbox-a curl -s -m 3 -o /dev/null -x http://10.99.0.2:3128 http://10.99.0.2:8080/ 2>/dev/null; then
+  if ip netns exec osb-sandbox-a curl -s -m 3 -o /dev/null --proxytunnel -x http://10.99.0.2:3128 http://10.99.0.2:8080/ 2>/dev/null; then
     fail "containment must survive egress restart"
   fi
   out="$(ip netns exec osb-sandbox-a curl -s -m 8 -H 'Host: ext.test' http://10.99.0.2/)"

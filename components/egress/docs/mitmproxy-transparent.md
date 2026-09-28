@@ -217,21 +217,24 @@ Semantics and limits:
   PERMANENT elements (no kernel timeout): every other rule in the table
   persists while the egress daemon is down (fail closed), and a kernel
   timeout would silently lapse the containment during a restart — expiry is
-  owned by the egress instead (the self-resolution loop prunes addresses the
-  resolvers stop returning, and table rebuilds re-seed from the in-memory
+  owned by the egress instead (the self-resolution loop prunes addresses absent
+  from two successful full-authority refreshes; sandbox DNS learning renews
+  retention, and table rebuilds re-seed from the in-memory
   mirror). The shared mitmdump resolves the hostname through the fastlet
   Pod's own resolver (cluster DNS), so the name must be resolvable there —
   the egress component does not redirect the Pod's own DNS. Because the
   dnsproxy's forward upstreams (`OPENSANDBOX_EGRESS_DNS_UPSTREAM` or
   `/etc/resolv.conf`) and the Pod resolver can return different address sets
   (split-horizon DNS, an operator-configured DNS upstream, or plain
-  rotation), the self-resolution loop queries **both** authorities and seeds
+  rotation), the self-resolution loop queries **both** authorities concurrently and seeds
   the drop sets with the union: an address only the Pod resolver returns is
   exactly one a sandbox could CONNECT directly, so containment must cover
-  it. The first seed retries with bounded backoff at startup and **fails
-  egress startup** if the hostname cannot be resolved (fail closed, like
-  every other initialization step — never serving sandboxes with an empty
-  drop set). Literal proxy IPs are seeded permanently.
+  it. Partial failures are logged and returned addresses are added without
+  pruning. The first seed resolves with bounded retries **before resetting
+  the nft table**; both authorities must complete successfully with a nonempty
+  union. Failure leaves the previous kernel table intact, while success installs
+  the seeded addresses atomically with the reset. DNS and nft application have
+  separate timeouts. Literal proxy IPs are seeded permanently.
 - **Requires `connection_strategy: lazy`** (the shipped default): eager
   connects upstream before any request exists, so no `via` can be applied.
 - **Config validation**: a malformed proxy URL, credentials in the URL, or

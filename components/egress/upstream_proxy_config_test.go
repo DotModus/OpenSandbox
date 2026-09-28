@@ -106,9 +106,9 @@ func TestUpstreamProxySpecForProfile(t *testing.T) {
 			wantSpec:    true,
 		},
 		{
-			name:        "proxy without transparent fails under fast-sandbox profile",
-			proxy:       "http://proxy.local:3128",
-			profile:     constants.ProfileFastSandbox,
+			name:    "proxy without transparent fails under fast-sandbox profile",
+			proxy:   "http://proxy.local:3128",
+			profile: constants.ProfileFastSandbox,
 			wantErrSubs: []string{
 				constants.EnvUpstreamProxy,
 				constants.EnvMitmproxyTransparent,
@@ -213,11 +213,11 @@ func TestUnionResolver(t *testing.T) {
 		}
 	})
 
-	t.Run("tolerates one failing authority", func(t *testing.T) {
+	t.Run("partial failure returns both answers and diagnostics", func(t *testing.T) {
 		ips, err := unionResolver(ctx, "proxy.test",
 			failing(context.DeadlineExceeded),
 			returning(nftables.ResolvedIP{Addr: b}))
-		if err != nil || len(ips) != 1 || ips[0].Addr != b {
+		if err == nil || !strings.Contains(err.Error(), "authority 1") || len(ips) != 1 || ips[0].Addr != b {
 			t.Fatalf("expected surviving authority's answers, got %+v err %v", ips, err)
 		}
 	})
@@ -252,10 +252,51 @@ func TestResolveUpstreamProxyHost(t *testing.T) {
 		func(context.Context, string) ([]nftables.ResolvedIP, error) {
 			return nil, context.DeadlineExceeded
 		})
-	if err != nil {
-		t.Fatalf("a failing dns authority must not fail the union: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "dnsproxy") {
+		t.Fatalf("a failing dns authority must be reported alongside surviving answers: %v", err)
 	}
 	if len(ips) == 0 {
 		t.Fatal("the pod resolver must cover the failing dns authority")
+	}
+}
+
+func TestUnionResolverStartsAuthoritiesConcurrently(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	secondStarted := make(chan struct{})
+	a := netip.MustParseAddr("10.0.0.1")
+	b := netip.MustParseAddr("10.0.0.2")
+	ips, err := unionResolver(ctx, "proxy.test",
+		func(ctx context.Context, _ string) ([]nftables.ResolvedIP, error) {
+			select {
+			case <-secondStarted:
+				return []nftables.ResolvedIP{{Addr: a}}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+		func(ctx context.Context, _ string) ([]nftables.ResolvedIP, error) {
+			close(secondStarted)
+			return []nftables.ResolvedIP{{Addr: b}}, ctx.Err()
+		})
+	if err != nil || len(ips) != 2 || ips[0].Addr != a || ips[1].Addr != b {
+		t.Fatalf("both authorities must start with a live deadline: ips=%v err=%v", ips, err)
+	}
+}
+
+func TestUnionResolverSlowAuthorityRetainsOtherAnswer(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	b := netip.MustParseAddr("10.0.0.2")
+	ips, err := unionResolver(ctx, "proxy.test",
+		func(ctx context.Context, _ string) ([]nftables.ResolvedIP, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+		func(ctx context.Context, _ string) ([]nftables.ResolvedIP, error) {
+			return []nftables.ResolvedIP{{Addr: b}}, ctx.Err()
+		})
+	if err == nil || len(ips) != 1 || ips[0].Addr != b {
+		t.Fatalf("a timed-out authority must not suppress the other answer: ips=%v err=%v", ips, err)
 	}
 }

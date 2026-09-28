@@ -88,6 +88,23 @@ func runFastSandboxProfile(ctx context.Context, upstreamSpec *mitmproxy.Upstream
 	}
 
 	podNft := fastsandboxnft.NewApplier(nil, fastSandboxNftOptions(upstreamSpec))
+	// Construct the resolver without starting its listener. Seed hostname
+	// containment BEFORE touching the previous generation's kernel table.
+	dnsAddr := ":15353"
+	proxy, err := dnsproxy.New(nil, dnsAddr, alwaysDeny, alwaysAllow)
+	if err != nil {
+		log.Fatalf("failed to init dns proxy: %v", err)
+	}
+	upstreamLookup := func(ctx context.Context, domain string) ([]nftables.ResolvedIP, error) {
+		return resolveUpstreamProxyHost(ctx, domain, proxy.ResolveDomain)
+	}
+	if upstreamSpec != nil {
+		if _, parseErr := netip.ParseAddr(upstreamSpec.Host); parseErr != nil {
+			if err := podNft.SeedUpstreamProxyIPs(ctx, upstreamSpec.Host, upstreamLookup); err != nil {
+				log.Fatalf("fast-sandbox upstream proxy %q: %v", upstreamSpec.Host, err)
+			}
+		}
+	}
 	// Recovery: wipe stale rules from a previous egress generation BEFORE
 	// serving action requests, so no dead subject's policy survives into a
 	// new sandbox. The Fastlet then detects the new handler instanceId and
@@ -138,11 +155,6 @@ func runFastSandboxProfile(ctx context.Context, upstreamSpec *mitmproxy.Upstream
 	// REDIRECTs (fast-sandbox server's installGatewayDNSRedirect) forward sandbox
 	// DNS addressed to gateway:53 here; per-query policy is dispatched by
 	// source IP.
-	dnsAddr := ":15353"
-	proxy, err := dnsproxy.New(nil, dnsAddr, alwaysDeny, alwaysAllow)
-	if err != nil {
-		log.Fatalf("failed to init dns proxy: %v", err)
-	}
 	if upstreamSpec != nil {
 		if _, parseErr := netip.ParseAddr(upstreamSpec.Host); parseErr != nil {
 			// Hostname endpoint: register it as an infrastructure domain so
@@ -162,14 +174,7 @@ func runFastSandboxProfile(ctx context.Context, upstreamSpec *mitmproxy.Upstream
 					log.Warnf("upstream proxy: nft update for %q failed: %v", domain, err)
 				}
 			})
-			if err := podNft.StartUpstreamProxyRefresh(ctx, host, func(ctx context.Context, domain string) ([]nftables.ResolvedIP, error) {
-				return resolveUpstreamProxyHost(ctx, domain, proxy.ResolveDomain)
-			}); err != nil {
-				// Fail closed like every other startup step: serving sandbox
-				// actions with an unseeded drop set would let any subject
-				// that learns the proxy IP CONNECT it directly.
-				log.Fatalf("fast-sandbox upstream proxy %q: %v", host, err)
-			}
+			podNft.StartUpstreamProxyRefresh(ctx, host, upstreamLookup)
 			log.Infof("upstream proxy: registered infra DNS domain %q (profile-wide sandbox drop, no allow-set feed, dual-resolver refresh)", host)
 		} else {
 			log.Infof("upstream proxy: literal endpoint %s:%d (profile-wide sandbox drop)", upstreamSpec.Host, upstreamSpec.Port)
@@ -257,7 +262,7 @@ func fastSandboxNftOptions(upstreamSpec *mitmproxy.UpstreamProxySpec) fastsandbo
 // proxy spec into the fast-sandbox containment endpoint. A literal IP seeds
 // the drop sets permanently; a hostname starts empty (fed by the infra
 // domain DNS path and the self-refresh loop). Port is always non-zero: the
-// spec parser fills the scheme default.
+// spec parser fills the scheme default. Hostnames are seeded before ApplyReset.
 func fastSandboxUpstreamEndpoint(spec *mitmproxy.UpstreamProxySpec) *fastsandboxnft.UpstreamProxyEndpoint {
 	if spec == nil {
 		return nil
@@ -295,21 +300,21 @@ func fastSandboxDoHOptions() fastsandboxnft.Options {
 // two return different address sets, and an address only the Pod resolver
 // returns is exactly one a sandbox could CONNECT directly (the open-relay
 // bypass). dnsLookup is injected for testing; in production it is the shared
-// dnsproxy's ResolveDomain. Pod-resolver answers carry no TTL (the
-// AddUpstreamProxyIPs TTL floor bounds them); an error is returned only when
-// both authorities fail.
+// dnsproxy's ResolveDomain. Pod-resolver answers carry no TTL; drop elements
+// are permanent. Partial answers accompany an error so refreshes can add
+// them without pruning, while startup requires a complete union.
 func resolveUpstreamProxyHost(ctx context.Context, domain string, dnsLookup func(context.Context, string) ([]nftables.ResolvedIP, error)) ([]nftables.ResolvedIP, error) {
 	ips, err := unionResolver(ctx, domain, dnsLookup, resolveViaPodResolver)
 	if err != nil {
-		return nil, fmt.Errorf("both resolver authorities failed for %q: %w", domain, err)
+		return ips, fmt.Errorf("resolver union for %q (authority 1=dnsproxy, 2=pod): %w", domain, err)
 	}
 	return ips, nil
 }
 
 // resolveViaPodResolver resolves through the Go default resolver —
 // /etc/resolv.conf and /etc/hosts, the same sources mitmdump's glibc resolver
-// uses for the chained dial. No TTL is knowable here (the AddUpstreamProxyIPs
-// TTL floor bounds the elements).
+// uses for the chained dial. No TTL is knowable here; the drop elements
+// are permanent and the refresh loop owns their retention.
 func resolveViaPodResolver(ctx context.Context, domain string) ([]nftables.ResolvedIP, error) {
 	addrs, err := net.DefaultResolver.LookupIP(ctx, "ip", domain)
 	if err != nil {
@@ -324,27 +329,41 @@ func resolveViaPodResolver(ctx context.Context, domain string) ([]nftables.Resol
 	return ips, nil
 }
 
-// unionResolver runs every lookup and unions the answers, tolerating partial
-// failure: an error is returned only when every authority failed. A
-// consistent-but-empty union (e.g. NXDOMAIN everywhere) is not an error —
-// the refresh loop logs it as "no addresses".
+// unionResolver runs authorities concurrently so a slow lookup cannot spend
+// another authority's deadline before it starts. Errors identify every failed
+// authority and accompany any successful answers; callers must not prune
+// using an incomplete union. Successful empty answers (NXDOMAIN) are allowed.
 func unionResolver(ctx context.Context, domain string, lookups ...func(context.Context, string) ([]nftables.ResolvedIP, error)) ([]nftables.ResolvedIP, error) {
+	type result struct {
+		index int
+		ips   []nftables.ResolvedIP
+		err   error
+	}
+	results := make(chan result, len(lookups))
+	for i, lookup := range lookups {
+		safego.Go(func() {
+			ips, err := lookup(ctx, domain)
+			results <- result{index: i, ips: ips, err: err}
+		})
+	}
+	// Keep the authority order stable for deduplication and diagnostics.
+	ordered := make([]result, len(lookups))
+	for range lookups {
+		r := <-results
+		ordered[r.index] = r
+	}
 	var (
 		ips  []nftables.ResolvedIP
 		errs []error
 	)
-	for _, lookup := range lookups {
-		resolved, err := lookup(ctx, domain)
-		if err != nil {
-			errs = append(errs, err)
+	for _, r := range ordered {
+		if r.err != nil {
+			errs = append(errs, fmt.Errorf("authority %d: %w", r.index+1, r.err))
 			continue
 		}
-		ips = append(ips, resolved...)
+		ips = append(ips, r.ips...)
 	}
-	if len(errs) == len(lookups) {
-		return nil, errors.Join(errs...)
-	}
-	return unionResolvedIPs(ips), nil
+	return unionResolvedIPs(ips), errors.Join(errs...)
 }
 
 // unionResolvedIPs dedupes per address, preferring the TTL-bearing entry:

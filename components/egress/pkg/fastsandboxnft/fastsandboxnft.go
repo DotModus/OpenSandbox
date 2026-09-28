@@ -182,16 +182,16 @@ type Applier struct {
 	sandboxMir func(context.Context, subject.Subject, []nftables.ResolvedIP) error
 
 	// upstreamIPs mirrors the DNS-learned upstream-proxy drop-set elements
-	// (a presence set — the elements are permanent in the kernel; expiry is
-	// owned by SyncUpstreamProxyIPs, not kernel timeouts), so table rebuilds
+	// and counts successful refreshes missing each address. Elements are
+	// permanent; SyncUpstreamProxyIPs owns expiry, not kernel timeouts. Rebuilds
 	// (subject removal, startup reset) re-seed them deterministically
 	// instead of losing the hostname containment until the next refresh
 	// tick. Literal endpoints are not mirrored: they are re-emitted from
 	// Options on every rebuild.
-	upstreamIPs map[netip.Addr]struct{}
+	upstreamIPs map[netip.Addr]uint8
 
 	// upstreamSeedTimeout bounds the first-seed retry window of
-	// StartUpstreamProxyRefresh (injectable for tests). Past it the caller
+	// SeedUpstreamProxyIPs (injectable for tests). Past it the caller
 	// fails startup: fail closed, like every other initialization step.
 	upstreamSeedTimeout time.Duration
 }
@@ -206,7 +206,7 @@ func NewApplier(r Runner, opts ...Options) *Applier {
 		run:                 r,
 		subjects:            make(map[subject.Subject]installedSubject),
 		states:              make(map[subject.Subject]*refreshState),
-		upstreamIPs:         make(map[netip.Addr]struct{}),
+		upstreamIPs:         make(map[netip.Addr]uint8),
 		upstreamSeedTimeout: upstreamProxySeedTimeout,
 		conntrack:           readConntrack,
 		now:                 time.Now,
