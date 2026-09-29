@@ -16,6 +16,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -763,6 +764,119 @@ func Test_collectTaskStatus(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func Test_collectTaskStatus_queryFailure(t *testing.T) {
+	runningTask := &api.Task{
+		Name: "task-1",
+		ProcessStatus: &api.ProcessStatus{
+			Running: &api.Running{StartedAt: metav1.Now()},
+		},
+	}
+	pod := func(name, ip string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status:     corev1.PodStatus{PodIP: ip},
+		}
+	}
+
+	tests := []struct {
+		name       string
+		allPods    []*corev1.Pod
+		wantStatus *api.Task
+	}{
+		{
+			name:       "pod still exists; keep last known status",
+			allPods:    []*corev1.Pod{pod("pod-1", "1.1.1.1")},
+			wantStatus: runningTask,
+		},
+		{
+			name:       "pod is gone; treat task as deleted",
+			allPods:    nil,
+			wantStatus: nil,
+		},
+		{
+			name:       "pod recreated with a new IP; treat task as deleted",
+			allPods:    []*corev1.Pod{pod("pod-1", "2.2.2.2")},
+			wantStatus: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctl := gomock.NewController(t)
+			mockCollector := NewMocktaskStatusCollector(ctl)
+			mockCollector.EXPECT().Collect(gomock.Any(), []string{"1.1.1.1"}).
+				Return(map[string]*api.Task{}, errors.New("timeout")).Times(1)
+
+			tNode := &taskNode{
+				ObjectMeta: metav1.ObjectMeta{Name: "task-1"},
+				IP:         "1.1.1.1",
+				PodName:    "pod-1",
+				Status:     runningTask,
+				tState:     RunningTaskState,
+			}
+			sch := &defaultTaskScheduler{
+				allPods:             tt.allPods,
+				taskStatusCollector: mockCollector,
+				logger:              testLogger,
+			}
+
+			sch.collectTaskStatus([]*taskNode{tNode})
+
+			if tNode.Status != tt.wantStatus {
+				t.Errorf("Status = %v, want %v", tNode.Status, tt.wantStatus)
+			}
+			if tNode.tState != RunningTaskState {
+				t.Errorf("tState = %v, want %v", tNode.tState, RunningTaskState)
+			}
+		})
+	}
+}
+
+// A failed status query while a task is being released must not mark it
+// released: the executor still has to be told to stop the task.
+func Test_defaultTaskScheduler_ScheduleKeepsReleasingOnQueryFailure(t *testing.T) {
+	ctl := gomock.NewController(t)
+	mockCollector := NewMocktaskStatusCollector(ctl)
+	mockCollector.EXPECT().Collect(gomock.Any(), []string{"1.1.1.1"}).
+		Return(map[string]*api.Task{}, errors.New("timeout")).Times(1)
+	mockClient := NewMocktaskClient(ctl)
+	mockClient.EXPECT().Set(gomock.Any(), nil).Return(nil, nil).Times(1)
+
+	tNode := &taskNode{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "task-1",
+			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+		},
+		IP:      "1.1.1.1",
+		PodName: "pod-1",
+		Status: &api.Task{
+			Name: "task-1",
+			ProcessStatus: &api.ProcessStatus{
+				Running: &api.Running{StartedAt: metav1.Now()},
+			},
+		},
+		tState: RunningTaskState,
+		sState: stateReleasing,
+	}
+	sch := &defaultTaskScheduler{
+		allPods: []*corev1.Pod{{
+			ObjectMeta: metav1.ObjectMeta{Name: "pod-1"},
+			Status:     corev1.PodStatus{PodIP: "1.1.1.1"},
+		}},
+		taskNodes:           []*taskNode{tNode},
+		maxConcurrency:      1,
+		taskStatusCollector: mockCollector,
+		taskClientCreator:   func(string) taskClient { return mockClient },
+		logger:              testLogger,
+	}
+
+	if err := sch.Schedule(); err != nil {
+		t.Fatalf("Schedule() error = %v", err)
+	}
+	if tNode.sState != stateReleasing {
+		t.Errorf("sState = %q, want %q", tNode.sState, stateReleasing)
 	}
 }
 
