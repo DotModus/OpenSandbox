@@ -535,12 +535,16 @@ class UpstreamProxyRuntimeTest(unittest.TestCase):
         # A hostname proxy endpoint must stay a hostname in server.address
         # while the dial resolves it: the server_connect guard compares
         # address[0] to the configured host, so this only passes if mitmproxy
-        # keeps "localhost" rather than the resolved IP.
+        # keeps the configured name rather than the resolved IP. The endpoint
+        # must be a dotted domain — dotless names (localhost included) are
+        # rejected at load because they resolve differently through resolver
+        # search lists — and it must dial the local relay, so use the public
+        # sslip.io wildcard that maps back to 127.0.0.1.
         port = _free_port()
         proc, log = _start_mitmdump(
             port,
             {
-                "OPENSANDBOX_EGRESS_UPSTREAM_PROXY": f"http://localhost:{self._proxy.port}",
+                "OPENSANDBOX_EGRESS_UPSTREAM_PROXY": f"http://127.0.0.1.sslip.io:{self._proxy.port}",
             },
         )
         try:
