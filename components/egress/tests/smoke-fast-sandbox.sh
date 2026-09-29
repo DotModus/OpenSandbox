@@ -467,6 +467,10 @@ else
   cp -f "${SCRIPT_DIR}/../mitmproxy/config.yaml" /var/lib/mitmproxy/.mitmproxy/config.yaml
   mkdir -p /var/egress/mitmscripts
   cp -f "${SCRIPT_DIR}/../mitmscripts/system.py" /var/egress/mitmscripts/system.py
+  # Test 13 chains through an upstream proxy: the egress passes the bundled
+  # upstream addon to mitmdump by absolute path when
+  # OPENSANDBOX_EGRESS_UPSTREAM_PROXY is set, so it must exist here too.
+  cp -f "${SCRIPT_DIR}/../mitmscripts/upstream_proxy.py" /var/egress/mitmscripts/upstream_proxy.py
   chown -R mitmproxy:mitmproxy /var/lib/mitmproxy
 
   kill "${EGRESS_PID}" 2>/dev/null
