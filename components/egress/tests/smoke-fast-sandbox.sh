@@ -725,9 +725,11 @@ else
 
   # Default-allow subject: still dropped — the containment is profile-wide,
   # above every per-subject rule. Control first: non-proxy traffic flows, so
-  # only the proxy endpoint is unreachable.
+  # only the proxy endpoint is unreachable. Subject a is still active, so
+  # this in-place binding update applies immediately — no data-plane-ready
+  # replay (the protocol sends no Hook for updates; a redundant one 409s on
+  # the fail-closed "no pending policy" guard).
   set_binding a 10.10.0.5 11 runtime-a-2 att-a-2 '{"defaultAction":"allow"}'
-  lifecycle_hook a runtime-a-2 att-a-2 sandbox.data-plane-ready
   out="$(ip netns exec osb-sandbox-a curl -s -m 5 -H 'Host: ext.test' http://10.99.0.2:8080/)"
   echo "${out}" | grep -qi "client=10.10.0.5" || fail "default-allow control request failed (subject inactive?); got: ${out}"
   if ip netns exec osb-sandbox-a curl -s -m 3 -o /dev/null --proxytunnel -x http://10.99.0.2:3128 http://10.99.0.2:8080/ 2>/dev/null; then
