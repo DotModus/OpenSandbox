@@ -62,6 +62,7 @@ Persistent and shared storage patterns for sandboxes.
 | [Host Volume Mount](/examples/host-volume-mount) | Mount host directories into sandboxes |
 | [Docker PVC Volume](/examples/docker-pvc-volume-mount) | Docker named volume mounts |
 | [Docker OSSFS Volume](/examples/docker-ossfs-volume-mount) | Docker OSSFS (OSS FUSE) mounts |
+| [rclone Volume Mount](/examples/rclone-volume-mount) | Remote storage through external Docker plugins or Kubernetes CSI volumes |
 | [Kubernetes PVC](/examples/kubernetes-pvc-volume-mount) | Kubernetes PersistentVolumeClaim mounts |
 
 ## How to Run

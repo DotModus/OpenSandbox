@@ -306,6 +306,10 @@ export default defineConfig({
               link: "/examples/docker-ossfs-volume-mount",
             },
             {
+              text: "rclone Volume Mount",
+              link: "/examples/rclone-volume-mount",
+            },
+            {
               text: "Kubernetes PVC",
               link: "/examples/kubernetes-pvc-volume-mount",
             },

@@ -3975,6 +3975,56 @@ class TestDockerVolumeValidation:
         assert binds[0] == "shared-models:/mnt/models:ro"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("read_only", [False, True])
+    async def test_external_plugin_volume_without_subpath(self, mock_docker, read_only):
+        """External drivers need neither a local Mountpoint nor server provisioning."""
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = []
+        mock_client.api.inspect_volume.return_value = {
+            "Name": "rclone-data",
+            "Driver": "rclone",
+            "Mountpoint": "",
+        }
+        mock_client.api.create_host_config.return_value = {}
+        mock_client.api.create_container.return_value = {"Id": "cid"}
+        mock_client.containers.get.return_value = MagicMock()
+        mock_docker.from_env.return_value = mock_client
+        service = DockerSandboxService(config=_app_config())
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=120,
+            resourceLimits=ResourceLimits(root={}),
+            entrypoint=["python"],
+            volumes=[
+                Volume(
+                    name="remote-storage",
+                    pvc=PVC(
+                        claim_name="rclone-data",
+                        create_if_not_exists=False,
+                        # Even an explicit cleanup request must not own a pre-existing volume.
+                        delete_on_sandbox_termination=True,
+                    ),
+                    mount_path="/mnt/remote",
+                    read_only=read_only,
+                ),
+            ],
+        )
+        with (
+            patch.object(service, "_ensure_image_available"),
+            patch.object(service, "_prepare_sandbox_runtime"),
+        ):
+            response = await service.create_sandbox(request)
+
+        assert response.status.state == "Running"
+        mode = "ro" if read_only else "rw"
+        assert mock_client.api.create_host_config.call_args.kwargs["binds"] == [
+            f"rclone-data:/mnt/remote:{mode}"
+        ]
+        mock_client.api.create_volume.assert_not_called()
+        labels = mock_client.api.create_container.call_args.kwargs["labels"]
+        assert json.loads(labels.get(SANDBOX_MANAGED_VOLUMES_LABEL, "[]")) == []
+
+    @pytest.mark.asyncio
     async def test_pvc_subpath_non_local_driver_rejected(self, mock_docker):
         mock_client = MagicMock()
         mock_client.containers.list.return_value = []
