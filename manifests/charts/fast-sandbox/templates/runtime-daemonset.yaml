@@ -124,7 +124,6 @@ data:
       enabled: true
       assetsDir: /opt/fast-sandbox/firecracker
       fcVersion: v1.16.1
-      kernelURL: ""
       interval: 5m
       minFree: 10GiB
       minMemory: 2GiB
@@ -181,7 +180,7 @@ spec:
       # and a regular Pod identity for the stable HRW node hostname file.
       containers:
       - name: firecracker-agent
-        image: {{ include "fast-sandbox.image" .Values.runtime.image }}
+        image: {{ include "fast-sandbox.image" (dict "repository" .Values.runtime.image.repository "tag" .Values.runtime.image.tag "appVersion" .Chart.AppVersion) }}
         imagePullPolicy: {{ .Values.runtime.image.pullPolicy }}
         # Only Downward API identities live in env; all tunables come from
         # the mounted agent config (nodeReadiness hot-reloads per pass).
@@ -252,7 +251,7 @@ spec:
       # this pod targets the firecracker runtime; the standalone janitor
       # DaemonSet keeps covering the containerd-based runtimes.
       - name: janitor
-        image: {{ include "fast-sandbox.image" .Values.janitor.image }}
+        image: {{ include "fast-sandbox.image" (dict "repository" .Values.janitor.image.repository "tag" .Values.janitor.image.tag "appVersion" .Chart.AppVersion) }}
         imagePullPolicy: {{ .Values.janitor.image.pullPolicy }}
         command: ["/workspace/janitor"]
         args: ["--scan-interval={{ .Values.janitor.scanInterval }}", "--orphan-timeout={{ .Values.janitor.orphanTimeout }}", "--containerd-socket="]

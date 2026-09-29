@@ -123,15 +123,25 @@ class ConnectionConfigSync(BaseModel):
 
         client_ip.apply_client_ip(self.headers)
 
-    def with_transport_if_missing(
+    @property
+    def owns_transport(self) -> bool:
+        """True when this config created (and may close) its transport."""
+        return self._owns_transport
+
+    def new_owned_transport(
         self,
         *,
         max_connections: int | None = 100,
         max_keepalive_connections: int = 20,
         keepalive_expiry: float = 30.0,
-    ) -> "ConnectionConfigSync":
-        if self.transport is not None:
-            return self
+    ) -> httpx.BaseTransport:
+        """
+        Build a fresh transport stack owned by the caller.
+
+        Same stack as `with_transport_if_missing` builds by default; the
+        shared `transport` on this config is never touched. Callers that
+        close what they build (e.g. adapter clients) can do so safely.
+        """
         ssl_context = httpx.create_ssl_context()
         inner = httpx.HTTPTransport(
             verify=ssl_context,
@@ -142,12 +152,28 @@ class ConnectionConfigSync(BaseModel):
             ),
         )
         bounded = DeadlineSyncTransport(inner, ssl_context)
-        wrapped: httpx.BaseTransport
         if self.retry_policy.wraps_transport():
-            wrapped = RetrySyncTransport(bounded, self.retry_policy, owns_inner=True)
-        else:
-            wrapped = bounded
-        config = self.model_copy(update={"transport": wrapped})
+            return RetrySyncTransport(bounded, self.retry_policy, owns_inner=True)
+        return bounded
+
+    def with_transport_if_missing(
+        self,
+        *,
+        max_connections: int | None = 100,
+        max_keepalive_connections: int = 20,
+        keepalive_expiry: float = 30.0,
+    ) -> "ConnectionConfigSync":
+        if self.transport is not None:
+            return self
+        config = self.model_copy(
+            update={
+                "transport": self.new_owned_transport(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_keepalive_connections,
+                    keepalive_expiry=keepalive_expiry,
+                )
+            }
+        )
         config._owns_transport = True
         return config
 
