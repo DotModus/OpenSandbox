@@ -152,7 +152,7 @@ if err != nil {
 }
 ```
 
-Native argv execution requires an updated execd. See [command execution modes](/components/execd#command-execution) for executable lookup and platform behavior.
+Native argv execution requires an updated execd. See [command execution modes](/architecture/data-plane/execd#command-execution) for executable lookup and platform behavior.
 
 ### Background commands
 
@@ -230,6 +230,22 @@ if err != nil {
 }
 fmt.Println(result.Text())
 ```
+
+### Persistent environment variables
+
+Set environment variables that the runtime injects into every subsequent command
+and session — without hand-writing shell escaping against the sandbox env file.
+
+```go
+err := sandbox.SetEnv(ctx, "MY_TOKEN", "it's a safe value")
+```
+
+Keys must match `[A-Za-z_][A-Za-z0-9_]*`. Values without a single quote are
+stored verbatim; values containing a single quote use the env file's
+double-quoted form, in which shell-style `$NAME` sequences may be expanded
+when the runtime loads the file. The env file is append-only: the
+last write for a key wins. Returns an error if the sandbox fails to persist the
+variable.
 
 For filesystem/process isolation within a sandbox, see
 [Isolation Sessions](/guides/isolation-sessions). These are separate from Bash sessions.
@@ -620,7 +636,7 @@ Created with `NewLifecycleClient(baseURL, apiKey string, opts ...Option)`.
 | `ResumeSandbox(ctx, id)` | Resume a paused sandbox |
 | `RenewExpiration(ctx, id, expiresAt)` | Extend sandbox expiration time |
 | `GetEndpoint(ctx, sandboxID, port, useServerProxy)` | Get public endpoint for a sandbox port |
-| `GetSignedEndpoint(ctx, sandboxID, port, expires)` | Get signed endpoint URL with OSEP-0011 route token |
+| `GetSignedEndpoint(ctx, sandboxID, port, expires)` | Get signed endpoint URL with a signed route token |
 | `CreateTemplate(ctx, req)` | Declare a fsb template (async golden-image build) |
 | `GetTemplate(ctx, templateID)` | Get a template with its latest build status |
 | `ListTemplates(ctx, opts)` | List templates with metadata filtering and pagination |

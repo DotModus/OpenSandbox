@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -130,6 +130,17 @@ class K8sDiagnosticsMixin:
         )
 
     def _find_pod_for_sandbox(self, sandbox_id: str):
+        workload_provider = getattr(self, "workload_provider", None)
+        if workload_provider is not None:
+            from opensandbox_server.services.k8s.workload_access import (
+                _get_owned_workload_or_404,
+            )
+
+            _get_owned_workload_or_404(
+                workload_provider,
+                self._resolve_namespace(),
+                sandbox_id,
+            )
         label_selector = f"{SANDBOX_ID_LABEL}={sandbox_id}"
         try:
             pods = self.k8s_client.list_pods(

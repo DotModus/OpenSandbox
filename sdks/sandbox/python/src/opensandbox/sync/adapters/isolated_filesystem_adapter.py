@@ -1,5 +1,5 @@
 #
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -212,7 +212,7 @@ class IsolatedFilesystemAdapterSync(FilesystemSync):
                     content_type = "application/octet-stream"
                 elif isinstance(entry.data, str):
                     encoding = entry.encoding or "utf-8"
-                    content = entry.data
+                    content = entry.data.encode(encoding)
                     content_type = f"text/plain; charset={encoding}"
                 elif isinstance(entry.data, IOBase):
                     if isinstance(entry.data, TextIOBase):

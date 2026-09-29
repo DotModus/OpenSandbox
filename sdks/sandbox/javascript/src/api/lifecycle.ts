@@ -1767,6 +1767,20 @@ export interface components {
              *     `["tail", "-f", "/dev/null"]`.
              */
             entrypoint?: string[];
+            /**
+             * @description Environment variables baked into the golden image (injected as
+             *     `/etc/sandbox-init.env` in the guest; literal values only). The
+             *     source image's own OCI `Config.Env` is inherited like a container
+             *     runtime would; an env with the same name here overrides the
+             *     inherited value. Names must be valid shell variable names
+             *     (`[A-Za-z_][A-Za-z0-9_]*`).
+             * @example {
+             *       "LOG_LEVEL": "info"
+             *     }
+             */
+            env?: {
+                [key: string]: string;
+            };
             /** @description Custom key-value metadata for management, filtering, and tagging. */
             metadata?: {
                 [key: string]: string;
@@ -1811,6 +1825,10 @@ export interface components {
             resourceLimits?: components["schemas"]["ResourceLimits"];
             /** @description Guest business command (argv). */
             entrypoint?: string[];
+            /** @description Environment variables baked into the golden image. */
+            env?: {
+                [key: string]: string;
+            };
             /** @description Custom metadata from the creation request. */
             metadata?: {
                 [key: string]: string;

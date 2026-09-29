@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1598,6 +1598,38 @@ class SystemAddonSubstitutionTest(unittest.TestCase):
 
         self.assertEqual("client substituted-secret", flow.request.headers.get("X-Template"))
         self.assertEqual("Bearer __header_secret__", flow.request.headers.get("Authorization"))
+
+    def test_streamed_request_injects_authorization_before_body_hook(self) -> None:
+        system = _load_system_module()
+        system._load_active_vault = lambda _client_ip=None: system.ActiveVault(
+            1,
+            [
+                {
+                    "name": "streamed-upload",
+                    "match": {
+                        "schemes": ["https"],
+                        "hosts": ["code.example.com"],
+                        "methods": ["POST"],
+                        "paths": ["/v1/chat/*"],
+                    },
+                    "headers": [
+                        {"name": "Authorization", "value": "Bearer synthetic-token"}
+                    ],
+                }
+            ],
+            ["Bearer synthetic-token"],
+        )
+        flow = _Flow()
+        flow.response = None
+        flow.request.method = "POST"
+        flow.request.path = "/v1/chat/completions"
+        flow.request.stream = True
+
+        system.requestheaders(flow)
+
+        self.assertEqual(
+            "Bearer synthetic-token", flow.request.headers.get("Authorization")
+        )
 
     def test_compressed_body_substitution_is_skipped(self) -> None:
         system = self._make_system_with_substitutions()

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,10 +46,17 @@ type policyUpdater interface {
 	UpdateAlwaysRules(alwaysDeny, alwaysAllow []policy.EgressRule)
 }
 
+type alwaysRulesLoader interface {
+	CurrentRules() (deny, allow []policy.EgressRule)
+	SetCurrentRules(deny, allow []policy.EgressRule)
+	RefreshIfDueWithApply(time.Time, func(deny, allow []policy.EgressRule) error) (deny, allow []policy.EgressRule, changed bool, err error)
+}
+
 // nftApplier: static allow/deny sets plus dynamic DNS-learned entries; teardown on shutdown.
 type nftApplier interface {
 	ApplyStatic(context.Context, *policy.NetworkPolicy) error
 	AddResolvedDomain(context.Context, string, []nftables.ResolvedIP) error
+	AddUpstreamProxyIPs(context.Context, []nftables.ResolvedIP) error
 	StartConnectionRefresh(context.Context)
 	StartDomainRefresh(context.Context, func(context.Context, string) ([]nftables.ResolvedIP, error))
 	RemoveEnforcement(context.Context) error
@@ -67,7 +74,7 @@ func startPolicyServer(
 	policyFile string,
 	alwaysDeny, alwaysAllow []policy.EgressRule,
 	mitmGate *mitmproxy.HealthGate,
-) (*http.Server, error) {
+) (*http.Server, *policyServer, error) {
 	maxEgressRules := maxEgressRulesFromEnv()
 	if maxEgressRules > 0 {
 		log.Infof("policy API: max egress rules per policy (POST/PATCH) = %d (set %s=0 to disable)", maxEgressRules, constants.EnvMaxEgressRules)
@@ -109,11 +116,11 @@ func startPolicyServer(
 		socketPath := envOrDefault(constants.EnvCredentialProxySocket, constants.DefaultCredentialProxySocket)
 		_, mitmGID, _, err := mitmproxy.LookupUser(mitmproxy.RunAsUser)
 		if err != nil {
-			return nil, fmt.Errorf("lookup credential proxy user %q: %w", mitmproxy.RunAsUser, err)
+			return nil, nil, fmt.Errorf("lookup credential proxy user %q: %w", mitmproxy.RunAsUser, err)
 		}
 		activeSrv, cleanupActiveSocket, err = credentialvault.StartActiveSocketServerRequestAware(handler.handleCredentialVaultActive, socketPath, int(mitmGID))
 		if err != nil {
-			return nil, fmt.Errorf("credential vault active socket: %w", err)
+			return nil, nil, fmt.Errorf("credential vault active socket: %w", err)
 		}
 		log.Infof("credential vault active API listening on unix socket %s", socketPath)
 	}
@@ -151,7 +158,7 @@ func startPolicyServer(
 			}
 			cancel()
 		}
-		return nil, err
+		return nil, nil, err
 	case <-time.After(200 * time.Millisecond):
 		handler.startAlwaysRuleReloadJob()
 		safego.Go(func() {
@@ -159,7 +166,7 @@ func startPolicyServer(
 				log.Errorf("policy server error: %v", err)
 			}
 		})
-		return srv, nil
+		return srv, handler, nil
 	}
 }
 
@@ -172,9 +179,9 @@ type policyServer struct {
 	nameserverIPs   []netip.Addr
 	policyFile      string     // if set, successful /policy changes persist (truncate+write+fsync)
 	maxEgressRules  int        // 0 = unlimited; cap len(Egress) for POST/PATCH
-	mu              sync.Mutex // serializes /policy handlers (no lost update across POST vs PATCH)
+	mu              sync.Mutex // serializes /policy updates with effective-policy reads and Vault writes
 
-	alwaysLoader     *policy.AlwaysRuleLoader
+	alwaysLoader     alwaysRulesLoader
 	stopAlwaysReload chan struct{}
 
 	lastAlwaysFP              uint64
@@ -215,6 +222,11 @@ func (s *policyServer) handlePolicy(w http.ResponseWriter, r *http.Request) {
 func (s *policyServer) handleCredentialVault(w http.ResponseWriter, r *http.Request) {
 	if !s.authorize(r) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if constants.IsTruthy(os.Getenv(constants.EnvExperimentalRevisionRuntime)) &&
+		(r.Method == http.MethodPost || r.Method == http.MethodPatch || r.Method == http.MethodDelete) {
+		http.Error(w, "credential vault writes are unavailable while the experimental revision runtime is enabled", http.StatusServiceUnavailable)
 		return
 	}
 	switch r.Method {
@@ -307,7 +319,11 @@ func (s *policyServer) handleCredentialVaultPost(w http.ResponseWriter, r *http.
 		http.Error(w, fmt.Sprintf("invalid credential vault request: %v", err), http.StatusBadRequest)
 		return
 	}
-	state, err := s.credentialVault.Create(req, s.effectivePolicy())
+	state, err := func() (credentialvault.State, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.credentialVault.Create(req, s.effectivePolicy())
+	}()
 	if err != nil {
 		credentialvault.WriteError(w, err)
 		return
@@ -329,7 +345,11 @@ func (s *policyServer) handleCredentialVaultPatch(w http.ResponseWriter, r *http
 		http.Error(w, fmt.Sprintf("invalid credential vault mutation request: %v", err), http.StatusBadRequest)
 		return
 	}
-	state, err := s.credentialVault.Patch(req, s.effectivePolicy())
+	state, err := func() (credentialvault.State, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.credentialVault.Patch(req, s.effectivePolicy())
+	}()
 	if err != nil {
 		credentialvault.WriteError(w, err)
 		return
@@ -346,7 +366,12 @@ func (s *policyServer) handleCredentialVaultDelete(w http.ResponseWriter, r *htt
 		http.Error(w, "credential vault writes require TLS or loopback transport", http.StatusUpgradeRequired)
 		return
 	}
-	if err := s.credentialVault.Delete(); err != nil {
+	err := func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.credentialVault.Delete()
+	}()
+	if err != nil {
 		credentialvault.WriteError(w, err)
 		return
 	}
@@ -661,15 +686,7 @@ func (s *policyServer) reloadAlwaysRulesJob() {
 	if !changed {
 		return
 	}
-	current := s.proxy.CurrentPolicy()
 	alwaysDeny, alwaysAllow := s.currentAlwaysRules()
-	merged := policy.MergeAlwaysOverlay(current, alwaysDeny, alwaysAllow)
-	if s.nft != nil {
-		if applyErr := s.nft.ApplyStatic(context.Background(), merged.WithExtraAllowIPs(s.nameserverIPs)); applyErr != nil {
-			log.Warnf("policy API: apply reloaded always rules to nftables failed: %v", applyErr)
-			return
-		}
-	}
 	fp := fingerprintRules(alwaysDeny, alwaysAllow)
 	if s.lastAlwaysFPSet && fp == s.lastAlwaysFP {
 		return
@@ -702,16 +719,35 @@ func (s *policyServer) reloadAlwaysRules() (bool, error) {
 	if s.alwaysLoader == nil {
 		return false, nil
 	}
-	deny, allow, changed, err := s.alwaysLoader.RefreshIfDue(time.Now())
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var stagedAllow []policy.EgressRule
+	deny, _, changed, err := s.alwaysLoader.RefreshIfDueWithApply(time.Now(), func(deny, allow []policy.EgressRule) error {
+		stagedAllow = withTelemetryAllow(allow)
+		if s.nft == nil {
+			return nil
+		}
+		current := s.proxy.CurrentPolicy()
+		if current == nil {
+			current = policy.DefaultDenyPolicy()
+		}
+		merged := policy.MergeAlwaysOverlay(current, deny, stagedAllow)
+		nftCtx, nftCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer nftCancel()
+		if err := s.nft.ApplyStatic(nftCtx, merged.WithExtraAllowIPs(s.nameserverIPs)); err != nil {
+			log.Warnf("policy API: apply reloaded always rules to nftables failed: %v", err)
+			return err
+		}
+		return nil
+	})
 	if err != nil {
 		return false, err
 	}
 	if !changed {
 		return false, nil
 	}
-	allow = withTelemetryAllow(allow)
-	s.setAlwaysRules(deny, allow)
-	s.proxy.UpdateAlwaysRules(deny, allow)
+	s.setAlwaysRules(deny, stagedAllow)
+	s.proxy.UpdateAlwaysRules(deny, stagedAllow)
 	return true, nil
 }
 

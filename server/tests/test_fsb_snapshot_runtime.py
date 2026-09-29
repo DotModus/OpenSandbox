@@ -1,7 +1,7 @@
 # pyright: reportAttributeAccessIssue=false
 # protobuf-generated modules expose dynamic attributes.
 
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -274,6 +274,7 @@ def test_start_status_watch_registers_namespaces_and_invokes_callback() -> None:
     }
     k8s.watch_handlers[0]("MODIFIED", cr)
 
+    assert PLURAL == "sandboxsnapshots"
     assert k8s.watch_calls == [
         ("sandbox.fast.io", "v1alpha2", "default", PLURAL),
         ("sandbox.fast.io", "v1alpha2", "tenant-a", PLURAL),

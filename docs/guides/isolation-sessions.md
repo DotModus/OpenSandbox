@@ -38,8 +38,9 @@ Component versions needed for the features covered by this guide:
   recommended** for `binds`, `List sessions`, `uid_mode: "userns"`, and the
   default writable allowlist (`/workspace`, `/mnt`, `/media`, `/data`)
 - `opensandbox-server` >= 0.2.1 — the server injects `CAP_SYS_ADMIN`,
-  `apparmor=unconfined`, and the tmpfs mount required by `bwrap` when the
-  execd image declares `bootstrap.execd.isolation`
+  unconfined AppArmor, seccomp, and protected-system-path settings, and the
+  tmpfs mount required by `bwrap` when the execd image declares
+  `bootstrap.execd.isolation`
 - Python SDK >= 0.1.14 (`isolation.run_once` / `isolation.session` context
   manager); >= 0.1.13 for the generated isolation client only
 - JavaScript / TypeScript SDK >= 0.1.10 (`isolation.runOnce` /
@@ -316,6 +317,44 @@ occupant's session data from leaking to the next.
 
 ---
 
+## Multiple Overlay Mounts
+
+A session can carry **several independent overlay mounts** via the `overlays`
+request field (the single `workspace` remains supported as sugar for a
+one-element list; when both are present, `workspace` is prepended):
+
+```json
+{
+  "overlays": [
+    { "path": "/", "mode": "overlay" },
+    { "path": "/workspace", "mode": "overlay", "persist": true },
+    { "path": "/data/scratch", "mode": "overlay", "persist": false }
+  ]
+}
+```
+
+- Each entry has its own mount semantics, so workspace files, system-level
+  changes (`apt install` → `/usr`, config → `/etc`), and additional project
+  directories get **independent copy-on-write uppers**.
+- Mounts are applied shallow-first; a nested overlay (e.g. `/workspace` on
+  top of a `/` root overlay) shadows its ancestors within its own subtree.
+  Paths must be absolute and unique.
+- `persist` (overlay mode only, default `true`): `true` allocates a host
+  upper directory under `upper_root`; `false` uses an ephemeral tmpfs upper
+  whose writes are discarded when the session ends. `rw`/`ro` entries must
+  not set `persist`. An ephemeral upper lives inside the namespace only, so
+  the files API serves `persist=false` overlays from their host-side
+  content: in-session writes under such an overlay are not observable
+  through the files API and files-API writes into it are rejected.
+- The files API routes each request to the overlay whose mount path is the
+  longest prefix of the requested path; relative paths resolve against the
+  first overlay.
+- Background runs use the **first** overlay for their log location: it must
+  be `rw`, or `overlay` with `persist: true`; otherwise background runs are
+  rejected.
+
+---
+
 ## Bind Mounts and Allowlist
 
 - **`extra_writable`** — paths bind-mounted read-write at the same path
@@ -503,8 +542,7 @@ still fail at runtime on such hosts. If you rely on `workspace.mode:
 
 ## Limitations
 
-- **`diff` / `commit` are Phase 2 stubs**, currently return `503`. Tracked
-  in [OSEP-0013](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0013-isolated-execution-api.md).
+- **`diff` / `commit` are Phase 2 stubs**, currently return `503`.
 - **No hardware-level guarantee.** Namespaces + seccomp only; pair with a
   secure runtime for kernel-exploit defense.
 - **Linux only.** Non-Linux builds return `available: false`.
@@ -515,7 +553,6 @@ still fail at runtime on such hosts. If you rely on `workspace.mode:
 
 ## See Also
 
-- [OSEP-0013 — Isolated Execution API](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0013-isolated-execution-api.md)
-- [execd](/components/execd)
+- [execd](/architecture/data-plane/execd)
 - [Secure Container Runtime](/guides/secure-container)
 - [execd OpenAPI spec](/api/)

@@ -3,7 +3,7 @@ title: Credential-Bound TLS Interception
 authors:
   - "@hpliStartAgain"
 creation-date: 2026-09-04
-last-updated: 2026-09-09
+last-updated: 2026-09-28
 status: implementing
 ---
 
@@ -827,9 +827,14 @@ acknowledgements. The always-loaded system addon now owns that endpoint only
 when the Go launcher supplies a complete internal per-process session bundle;
 missing configuration keeps it disabled, partial configuration fails startup,
 and addon shutdown fences the receiver and removes its owned socket. The Go
-launcher strips inherited bundle values and can hand off a validated bundle,
-but the current sidecar and fast-sandbox assembly still pass none. An unused Go
-process-session owner now creates a private per-process receiver directory,
+launcher strips inherited bundle values and can hand off a validated bundle.
+Behind an internal development-only gate, the sidecar assembly now gives every
+initial or restarted mitmdump process a fresh session bundle and keeps health
+not-ready until the current in-memory Vault snapshot, or the authoritative
+initial empty state, is exactly acknowledged. Fast Sandbox still passes no
+bundle, and the gate defaults off. Public Vault writes are rejected while the
+internal gate is enabled until mutation acknowledgement is wired. The Go
+process-session owner creates a private per-process receiver directory,
 high-entropy control generation and token, matching launcher bundle, Unix
 transport, and coordinator. It accepts readiness only from an authenticated
 fresh receiver with no active revision. Directory operations stay anchored to a
@@ -839,16 +844,73 @@ a replaced directory identity. The session owner can now bootstrap one
 authoritative empty or restored `ActiveSnapshot`: it first marshals the canonical
 decision payload, requires an authenticated fresh receiver, applies the
 prepare/commit transaction, and returns only after the coordinator confirms the
-exact identity. Live launch/restart invocation, indeterminate startup
-reconciliation, connection teardown, and the public Vault mutation path remain
-unwired. Startup/recovery and atomic public-store finalization under the shared
-mutation barrier remain integration work.
+exact identity. It can also reconcile an indeterminate bootstrap through
+metadata-only readback and exact commit/abort retries: a confirmed identity
+completes bootstrap, while a confirmed non-activation returns to an idle state
+that permits a new candidate. When a candidate allocated by `Apply` has an
+indeterminate prepare/abort or commit outcome, the call returns that exact
+attempt identity with `ErrIndeterminate`; that identity is not proof of
+activation, and the caller must compare it exactly with a later reconciliation
+result before publishing. Attempt identity is now also retained by the private
+ProcessSession API, but public mutation and atomic public-store finalization,
+along with connection fencing, remain unwired. Durable recovery intent after a
+complete sidecar replacement remains integration work.
+
+ProcessSession now also exposes an internal post-bootstrap `Update` primitive
+and exact-attempt `ReconcileUpdate`. A future caller must keep its Vault
+candidate unpublished while holding the shared mutation barrier. A successful
+`Update` confirms its exact identity and permits finalization. After an
+indeterminate update, the session retains the exact attempt and the exact
+previous confirmed identity. `ReconcileUpdate` accepts only that outstanding
+attempt: it permits finalization only when it confirms that attempt active, and
+permits discarding only when it confirms the frozen previous identity remains
+active. Other attempts are rejected without transport activity; reconciliation
+errors retain the attempt, and a concurrent update remains blocked without
+transport activity.
+
+The sidecar now has an internal generation-pinned callback that holds the live
+process/session lifecycle read lock for the callback's full duration. This is
+only an ownership primitive: public mutation handlers, Vault Store candidate
+finalization, and connection fences are still not connected to it, so no
+public mutation acknowledgement is live. The callback accepts only the narrow
+update/reconcile session interface and requires a bounded context with a
+deadline canceled when sidecar shutdown begins. Callbacks must pass that same
+context to session operations and return promptly on cancellation; shutdown
+waits for a running callback to release the lifecycle read lock, and the helper
+cannot terminate a callback that ignores cancellation.
+
+`ErrClosed` and `ErrTransportUnavailable`, including a local parent-path fence
+failure after the receiver committed, are terminal session failures rather
+than reconcilable mutation outcomes. They return no attempt identity and never
+authorize candidate finalization. The future owner must stop the exact child,
+close the session, discard the unpublished candidate, and start a fresh session
+from the prior public state. This primitive does not connect public mutation
+handlers, finalize the Vault store, or install connection fences; selective
+TLS decisions remain disabled.
+
+The Go Vault store can now prepare unpublished create, patch, and delete
+candidates. A candidate freezes its rendered `ActiveSnapshot` before commit,
+publishes at most once, and uses a private mutation tag to reject concurrent
+changes and delete/recreate ABA even when the public Vault revision repeats.
+This is only the store-side prerequisite: the public handlers still return
+`503` under the internal gate, and ProcessSession update acknowledgement and
+connection fencing remain unwired. The sidecar's existing policy mutex now
+serializes effective-policy reads plus Vault create/patch/delete with `/policy`
+updates. Periodic `deny.always` / `allow.always` reload now uses this same
+barrier: it parses a candidate pair and, when an nft applier is configured,
+applies the corresponding static policy before publishing the loader and proxy
+rules. An `ApplyStatic` error preserves the active in-memory rules and leaves
+the candidate eligible for a later retry; parse errors do the same. This is a
+scoped nft-first staging boundary, not a revision transaction, and it makes no
+claim that an external nft apply error has no side effects. Vault binding
+revalidation, ProcessSession update acknowledgement, and connection fencing
+remain unconnected; no selective TLS decision is enabled by this change.
 
 The proxy-side transaction receiver validates
 generation/epoch/digest identities, stages immutable bytes, and implements
 commit, abort, and metadata-only readback. Its authenticated IPC endpoint is
-conditionally attached to the live addon as described above, but no running
-egress profile supplies a session yet. An unused Go builder now emits
+conditionally attached to the live addon as described above; only the gated
+sidecar startup/restart path supplies a session. The Go builder emits
 the versioned canonical decision payload from a rendered Vault snapshot and
 policy epoch. It derives and sorts HTTPS selectors from the same canonical
 bindings, preserves redaction order, and rejects non-canonical revisions,
@@ -856,11 +918,10 @@ selectors, or rendered credential/redaction coverage. A matching unused Python
 validator now strictly decodes those exact bytes, checks envelope vault/policy
 agreement, recomputes active state and HTTPS selectors from the full bindings,
 and rejects incomplete redaction coverage with a fixed sanitized error. The
-next integration must consume and bootstrap a fresh process session during
-launch/restart, reconcile any indeterminate transaction before readiness, and
-add connection fences before acknowledging public Vault mutations. Existing
-request processing continues to use the conditional ETag lookup until that
-integration is ready.
+next integration must place public policy/Vault mutations and revision
+installation under the shared mutation barrier, then add connection fences
+before acknowledging those mutations. Existing request processing continues to
+use the conditional ETag lookup, and no selective TLS decision is enabled yet.
 
 Implementation has started with the internal host-selector algebra and shared
 Go/Python conformance vectors. The control plane owns non-transitional UTS #46
@@ -870,6 +931,19 @@ lookup to project host coverage and exports a separate request-sample counter.
 It performs no ClientHello lookup and does not enable selective interception;
 opaque connections and failed handshakes are outside its observation set. The
 public interception mode remains unavailable until the later phases pass.
+
+The Python side now also has a pure ClientHello decision foundation. It builds
+an immutable TLS selector view only after strict validation of a real canonical
+revision snapshot, retaining revision metadata and parsed host selectors while
+discarding payload and credential-bearing bindings. Classification follows the
+early identity, ECH, no-SNI, invalid-SNI, static-ignore, snapshot-generation,
+and binding-host order, and reports only closed action/reason values. A bound
+host returns `needs_registry`; this is not a decrypt instruction. This step
+fails malformed ECH/static-selector arguments closed with `reason=invalid_input`
+while preserving early identity, ECH, and no-SNI ordering. It does not connect
+the classifier to the system addon or receiver commit path,
+does not add a connection registry, and does not change Go, public
+configuration, or live traffic. Selective TLS remains disabled.
 
 1. **Decision telemetry and red tests**
    - Add fail-closed tests that distinguish authoritative empty from lookup

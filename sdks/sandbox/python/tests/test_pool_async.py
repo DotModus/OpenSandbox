@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -452,7 +452,97 @@ async def test_async_acquire_direct_create_kills_and_closes_when_renew_fails() -
 
 
 @pytest.mark.asyncio
-async def test_async_direct_create_failure_after_run_retired_is_pool_not_running() -> None:
+@pytest.mark.parametrize("source", ["idle", "direct", "creator"])
+@pytest.mark.parametrize("phase", ["renew", "fence"])
+async def test_acquire_cancellation_finishes_owned_sandbox_cleanup(
+    source: str,
+    phase: str,
+) -> None:
+    entered = asyncio.Event()
+    kill_started = asyncio.Event()
+    finish_kill = asyncio.Event()
+    never = asyncio.Event()
+
+    class BlockingSandbox(FakeAsyncSandbox):
+        def __init__(self) -> None:
+            super().__init__("owned-sandbox")
+            self.client = httpx.AsyncClient()
+
+        async def renew(self, timeout: timedelta) -> None:
+            if phase == "renew":
+                entered.set()
+                await never.wait()
+
+        async def kill(self) -> None:
+            kill_started.set()
+            await finish_kill.wait()
+            self.killed = True
+
+        async def close(self) -> None:
+            await self.client.aclose()
+            self.closed = True
+
+    sandbox = BlockingSandbox()
+
+    class BlockingStore(InMemoryAsyncPoolStateStore):
+        async def get_destroy_state(self, pool_name: str) -> Any:
+            if phase == "fence" and returned_sandbox:
+                entered.set()
+                await never.wait()
+            return await super().get_destroy_state(pool_name)
+
+    returned_sandbox = False
+
+    async def provide(*args: Any, **kwargs: Any) -> BlockingSandbox:
+        nonlocal returned_sandbox
+        returned_sandbox = True
+        return sandbox
+
+    class Factory:
+        create = staticmethod(provide)
+        connect = staticmethod(provide)
+
+    store = BlockingStore()
+    pool = SandboxPoolAsync(
+        pool_name="pool",
+        max_idle=0,
+        state_store=store,
+        connection_config=ConnectionConfig(),
+        creation_spec=PoolCreationSpec(image="ubuntu:22.04"),
+        sandbox_creator=provide if source == "creator" else None,
+        sandbox_factory=Factory,  # type: ignore[arg-type]
+        sandbox_manager_factory=lambda config: _manager_factory(FakeAsyncManager()),
+    )
+    await pool.start()
+    if source == "idle":
+        await store.put_idle("pool", sandbox.id)
+    acquisition = asyncio.create_task(
+        pool.acquire(sandbox_timeout=timedelta(minutes=5))
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        acquisition.cancel()
+        await asyncio.wait_for(kill_started.wait(), timeout=2)
+        acquisition.cancel()
+        finish_kill.set()
+        with pytest.raises(asyncio.CancelledError):
+            await acquisition
+        assert sandbox.killed
+        assert sandbox.client.is_closed
+        assert (await store.snapshot_counters("pool")).idle_count == 0
+    finally:
+        returned_sandbox = False
+        finish_kill.set()
+        acquisition.cancel()
+        await asyncio.gather(acquisition, return_exceptions=True)
+        await sandbox.client.aclose()
+        await pool.shutdown(False)
+
+
+@pytest.mark.asyncio
+async def test_async_direct_create_failure_after_run_retired_is_pool_not_running() -> (
+    None
+):
     pool = _create_pool(max_idle=0)
     await pool.start()
 
@@ -996,6 +1086,40 @@ def _create_pool(
         ),
         sandbox_factory=FakeAsyncSandbox,  # type: ignore[arg-type]
     )
+
+
+async def test_async_graceful_shutdown_superseded_by_start_keeps_new_run_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a graceful shutdown releases _lifecycle_lock while draining
+    in-flight operations. A start() that installs a newer run inside that
+    window must survive: the superseded shutdown may not cancel the new run's
+    scheduler/heartbeat tasks, tear down its warmup tasks, or stomp its
+    RUNNING state to STOPPED.
+    """
+    pool = _create_pool(max_idle=0)
+    await pool.start()
+    old_generation = pool._run_generation
+    drain_started = asyncio.Event()
+    release_drain = asyncio.Event()
+    original_drain = pool._await_in_flight_drain
+
+    async def paused_drain(timeout: timedelta) -> bool:
+        drain_started.set()
+        await release_drain.wait()
+        return await original_drain(timeout)
+
+    monkeypatch.setattr(pool, "_await_in_flight_drain", paused_drain)
+    shutdown_task = asyncio.create_task(pool.shutdown(graceful=True))
+    await drain_started.wait()
+    await pool.start()
+    release_drain.set()
+    await shutdown_task
+    assert pool._run_generation == old_generation + 1
+    assert pool._lifecycle_state == PoolLifecycleState.RUNNING
+    assert pool._scheduler_task is not None and not pool._scheduler_task.done()
+    assert pool._heartbeat_task is not None and not pool._heartbeat_task.done()
+    await pool.shutdown(graceful=False)
 
 
 async def test_async_acquire_retry_next_idle_empty_raises_pool_empty() -> None:

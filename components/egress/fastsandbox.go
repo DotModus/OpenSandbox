@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -194,7 +194,7 @@ func runFastSandboxProfile(ctx context.Context) {
 		log.Errorf("fast-sandbox dns proxy shutdown error: %v", err)
 	}
 	if fastSandboxMitm != nil {
-		mitmproxy.GracefulShutdown(fastSandboxMitm.getRunning(), 3*time.Second)
+		fastSandboxMitm.shutdown(3 * time.Second)
 	}
 	// Enforcement is intentionally NOT removed: the kernel rules keep denying
 	// while the daemon is down (fail closed); the next start wipes them via
