@@ -410,6 +410,10 @@ func TestTaskManager_List(t *testing.T) {
 	mgr, _ := setupTestManager(t)
 	ctx := context.Background()
 
+	// Start the manager so task deletion is finalized before t.TempDir cleanup.
+	mgr.Start(ctx)
+	defer mgr.Stop()
+
 	// Initially empty
 	tasks, err := mgr.List(ctx)
 	if err != nil {
@@ -431,7 +435,7 @@ func TestTaskManager_List(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create() failed: %v", err)
 	}
-	defer mgr.Delete(ctx, task.Name)
+	defer cleanupTask(t, mgr, task.Name)
 
 	// List should return 1 task
 	tasks, err = mgr.List(ctx)
