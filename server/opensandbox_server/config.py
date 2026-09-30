@@ -609,7 +609,8 @@ class ServerConfig(BaseModel):
         default=None,
         ge=60,
         description=(
-            "Maximum allowed sandbox TTL in seconds for requests that specify timeout. "
+            "Maximum allowed sandbox TTL in seconds for create requests that specify timeout. "
+            "Does not apply to renew-expiration requests or cap total sandbox lifetime. "
             "Omit from config to disable the server-side upper bound."
         ),
     )

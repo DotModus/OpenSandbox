@@ -940,7 +940,11 @@ class RenewSandboxExpirationRequest(BaseModel):
     expires_at: datetime = Field(
         ...,
         alias="expiresAt",
-        description="New absolute expiration time in UTC (RFC 3339 format). Must be in the future.",
+        description=(
+            "New absolute expiration time in UTC (RFC 3339 format). Must be in the future. "
+            "May be earlier than, equal to, or later than the current expiresAt. "
+            "The creation-time limit server.max_sandbox_timeout_seconds does not apply."
+        ),
     )
 
     class Config:

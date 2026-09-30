@@ -634,7 +634,7 @@ Created with `NewLifecycleClient(baseURL, apiKey string, opts ...Option)`.
 | `DeleteSandbox(ctx, id)` | Delete a sandbox |
 | `PauseSandbox(ctx, id)` | Pause a running sandbox |
 | `ResumeSandbox(ctx, id)` | Resume a paused sandbox |
-| `RenewExpiration(ctx, id, expiresAt)` | Extend sandbox expiration time |
+| `RenewExpiration(ctx, id, expiresAt)` | Set sandbox expiration to a future timestamp (may shorten or extend) |
 | `GetEndpoint(ctx, sandboxID, port, useServerProxy)` | Get public endpoint for a sandbox port |
 | `GetSignedEndpoint(ctx, sandboxID, port, expires)` | Get signed endpoint URL with a signed route token |
 | `CreateTemplate(ctx, req)` | Declare a fsb template (async golden-image build) |

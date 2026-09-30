@@ -866,6 +866,41 @@ async def test_mixed_create_keeps_legacy_semantics(persisted_fsb):
     legacy.create_sandbox.assert_awaited_once_with(request)
 
 
+@pytest.mark.parametrize(
+    "delta_seconds",
+    [-600, 0, 600, 10800],
+    ids=["shorten", "unchanged", "extend", "above-create-limit"],
+)
+def test_http_renew_sets_future_timestamp_without_create_limit(http_fsb, delta_seconds):
+    client, fake, _ = http_fsb
+    response = client.post(
+        "/v1/sandboxes",
+        json={
+            "image": {"uri": "python:3.11"},
+            "entrypoint": ["python"],
+            "timeout": 1800,
+            "resourceLimits": {"cpu": "500m", "memory": "512Mi"},
+        },
+    )
+    assert response.status_code == 202
+    sandbox_id = response.json()["id"]
+    cr = fake.crs[("ns-1", sandbox_id)]
+    current_expiration = datetime.fromisoformat(cr["spec"]["expireTime"])
+    new_expiration = current_expiration + timedelta(seconds=delta_seconds)
+
+    renewed = client.post(
+        f"/v1/sandboxes/{sandbox_id}/renew-expiration",
+        json={"expiresAt": new_expiration.isoformat()},
+    )
+
+    assert renewed.status_code == 200
+    assert datetime.fromisoformat(
+        renewed.json()["expiresAt"].replace("Z", "+00:00")
+    ) == new_expiration
+    assert fake.last_update.expires_at_unix_seconds == int(new_expiration.timestamp())
+    assert datetime.fromisoformat(cr["spec"]["expireTime"]) == new_expiration
+
+
 def test_http_renew_and_delete_use_uid_fences(http_fsb):
     client, fake, _ = http_fsb
     created = client.post(

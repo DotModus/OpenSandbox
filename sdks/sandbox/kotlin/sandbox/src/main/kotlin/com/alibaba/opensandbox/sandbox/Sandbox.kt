@@ -709,9 +709,11 @@ class Sandbox internal constructor(
     }
 
     /**
-     * Renew the sandbox expiration time to delay automatic termination.
+     * Set the sandbox expiration time.
      *
      * The new expiration time will be set to the current time plus the provided duration.
+     * This may shorten or extend the remaining lifetime. The creation-time
+     * server timeout limit does not apply.
      *
      * @param timeout Duration to add to the current time to set the new expiration
      * @throws SandboxException if the operation fails

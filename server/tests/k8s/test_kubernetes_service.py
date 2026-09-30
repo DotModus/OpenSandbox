@@ -2508,6 +2508,33 @@ class TestListSandboxes:
         assert response.items[0].platform is None
 
 class TestRenewExpiration:
+
+    @pytest.mark.parametrize(
+        "delta_seconds",
+        [-600, 0, 600, 7200],
+        ids=["shorten", "unchanged", "extend", "above-create-limit"],
+    )
+    def test_renew_sets_future_timestamp_without_create_limit(
+        self, k8s_service, mock_workload, delta_seconds
+    ):
+        from opensandbox_server.api.schema import RenewSandboxExpirationRequest
+
+        k8s_service.app_config.server.max_sandbox_timeout_seconds = 3600
+        current_expiration = datetime.now(timezone.utc) + timedelta(minutes=30)
+        new_expiration = current_expiration + timedelta(seconds=delta_seconds)
+        k8s_service.workload_provider.get_workload.return_value = mock_workload
+        k8s_service.workload_provider.get_expiration.return_value = current_expiration
+
+        response = k8s_service.renew_expiration(
+            "test-sandbox-id", RenewSandboxExpirationRequest(expiresAt=new_expiration)
+        )
+
+        assert response.expires_at == new_expiration
+        k8s_service.workload_provider.update_expiration.assert_called_once_with(
+            sandbox_id="test-sandbox-id",
+            namespace=k8s_service.namespace,
+            expires_at=new_expiration,
+        )
     
     def test_renew_expiration_succeeds(self, k8s_service, mock_workload):
         new_expiration = datetime.now(timezone.utc) + timedelta(hours=2)

@@ -1084,6 +1084,8 @@ export class Sandbox {
 
   /**
    * Renew expiration by setting expiresAt to now + timeoutSeconds.
+   * This may shorten or extend the remaining lifetime. The creation-time
+   * server timeout limit does not apply.
    */
   async renew(timeoutSeconds: number): Promise<RenewSandboxExpirationResponse> {
     const expiresAt = new Date(
