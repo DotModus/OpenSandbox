@@ -19,8 +19,9 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 	"github.com/gin-gonic/gin"
+
+	"github.com/alibaba/opensandbox/execd/pkg/web/model"
 )
 
 // FilesystemWorkerArg selects the internal, single-request worker entrypoint.
