@@ -1132,6 +1132,8 @@ paths:
                 type: object
                 additionalProperties:
                   $ref: "#/components/schemas/FileInfo"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
@@ -1175,6 +1177,8 @@ paths:
           description: The requested identity could not be established or the worker failed; no fallback to Execd identity occurs.
         "200":
           description: Files deleted successfully
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
@@ -1730,6 +1734,8 @@ paths:
           description: The requested identity could not be established or the worker failed; no fallback to Execd identity occurs.
         "200":
           description: Directories deleted successfully
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalServerError"
 
