@@ -189,6 +189,43 @@ func TestDispatchPauseResume_Case1_PauseTrue(t *testing.T) {
 	assert.Equal(t, int64(2), updated.Status.PauseObservedGeneration)
 }
 
+func TestDispatchPauseResume_Case1_PauseTrue_AlreadyPaused(t *testing.T) {
+	// Paused, pause=true, gen > pauseObservedGen (for example a renew-only spec change)
+	// → the paused state is left alone; handlePause must not run again.
+	bs := &sandboxv1alpha1.BatchSandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "test-bs",
+			Namespace:  "default",
+			Generation: 3,
+		},
+		Spec: sandboxv1alpha1.BatchSandboxSpec{
+			Pause:    ptr.To(true),
+			Replicas: ptr.To(int32(1)),
+			Template: &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: "main", Image: "img"}},
+				},
+			},
+		},
+		Status: sandboxv1alpha1.BatchSandboxStatus{
+			Phase:                   sandboxv1alpha1.BatchSandboxPhasePaused,
+			PauseObservedGeneration: 2,
+		},
+	}
+	r := newTestReconciler(bs)
+	_, handled, err := r.dispatchPauseResume(context.Background(), bs)
+	require.NoError(t, err)
+	assert.False(t, handled, "an already Paused sandbox must not be re-paused")
+
+	updated := &sandboxv1alpha1.BatchSandbox{}
+	require.NoError(t, r.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "test-bs"}, updated))
+	assert.Equal(t, sandboxv1alpha1.BatchSandboxPhasePaused, updated.Status.Phase)
+
+	snapshot := &sandboxv1alpha1.SandboxSnapshot{}
+	err = r.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: internalPauseSnapshotName("test-bs")}, snapshot)
+	assert.True(t, apierrors.IsNotFound(err), "no new pause snapshot should be created")
+}
+
 func TestDispatchPauseResume_Case2_PauseFalse(t *testing.T) {
 	// gen > pauseObservedGen, pause=false → handleResume dispatched
 	snapshot := &sandboxv1alpha1.SandboxSnapshot{
