@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -141,6 +141,19 @@ func decodeConfig(raw []byte) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// ValidateConfig validates a lifecycle config decoded outside the standard
+// LoadConfig transport (e.g. the POST /internal/init request body). A zero version is
+// defaulted to the current config version.
+func ValidateConfig(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	if cfg.Version == 0 {
+		cfg.Version = configVersion
+	}
+	return cfg.validate()
 }
 
 func (c *Config) validate() error {

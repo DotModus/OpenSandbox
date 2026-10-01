@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd..
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -225,8 +225,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Execute shell command
-         * @description Executes a shell command and streams the output in real-time using SSE (Server-Sent Events).
+         * Execute shell command or native argv
+         * @description Executes shell text (`command`) or native arguments (`argv`) and streams output using SSE; supply exactly one input mode.
          *     The command can run in foreground or background mode. The response includes stdout, stderr,
          *     execution status, and completion events.
          *     Optionally specify `timeout` (milliseconds) to enforce a maximum runtime; the server will
@@ -256,6 +256,8 @@ export interface paths {
          * Get command running status
          * @description Returns the current status of a command (foreground or background) by command ID.
          *     Includes running flag, exit code, error (if any), and start/finish timestamps.
+         *     Completed command metadata is retained for at least 24 hours and then removed
+         *     by an hourly cleanup. Running commands are never removed by retention cleanup.
          */
         get: operations["getCommandStatus"];
         put?: never;
@@ -282,6 +284,8 @@ export interface paths {
          *     tail cursor for the next poll. When no starting line is provided, the full logs are returned.
          *     Response body is plain text so it can be rendered directly in browsers; the latest line index
          *     is provided via response header `EXECD-COMMANDS-TAIL-CURSOR` for subsequent incremental requests.
+         *     Completed background command output is retained for at least 24 hours and then
+         *     removed by an hourly cleanup. Running command output is never removed by retention cleanup.
          */
         get: operations["getBackgroundCommandLogs"];
         put?: never;
@@ -1004,15 +1008,24 @@ export interface components {
              */
             code: string;
         };
-        /** @description Request to execute a shell command */
+        /** @description Execute exactly one of command (shell text) or argv (native arguments). */
         RunCommandRequest: {
             /**
-             * @description Shell command to execute
+             * @description Shell command to execute. Mutually exclusive with argv.
              * @example ls -la /workspace
              */
-            command: string;
+            command?: string;
             /**
-             * @description Working directory for command execution
+             * @description Executable and literal arguments, mutually exclusive with command. argv[0] must be non-empty; NUL is invalid and arguments are not shell-expanded. Relative paths use cwd; bare names search absolute entries in the child PATH. Windows uses standard argument encoding and adds .exe to extensionless names; batch files require a shell.
+             * @example [
+             *       "python3",
+             *       "-c",
+             *       "print('hello')"
+             *     ]
+             */
+            argv?: string[];
+            /**
+             * @description Working directory, defaulting to the daemon directory. Expands $NAME and ${NAME} using the command environment, and leading ~ using the daemon user's home. Undefined variables fail validation.
              * @example /workspace
              */
             cwd?: string;
@@ -1041,7 +1054,7 @@ export interface components {
              */
             gid?: number;
             /**
-             * @description Environment variables injected into the command process.
+             * @description Literal request values overriding EXECD_ENVS and daemon variables, in that order. Names are case-insensitive on Windows.
              * @example {
              *       "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
              *       "PYTHONUNBUFFERED": "1"
@@ -1050,7 +1063,7 @@ export interface components {
             envs?: {
                 [key: string]: string;
             };
-        };
+        } & (unknown | unknown);
         /** @description Command execution status (foreground or background) */
         CommandStatusResponse: {
             /**
@@ -1323,10 +1336,13 @@ export interface components {
              */
             message: string;
         };
+        /** @description Creates an isolated session with one or more overlay mounts. The legacy `workspace` field is kept as sugar for a single-element `overlays` list: at least one of `workspace` or `overlays` must be provided, and when both are present `workspace` is prepended to `overlays`. */
         CreateIsolatedSessionRequest: {
             /** @enum {string} */
             profile?: "strict" | "balanced";
-            workspace: components["schemas"]["IsolatedWorkspaceSpec"];
+            workspace?: components["schemas"]["IsolatedWorkspaceSpec"];
+            /** @description Independent overlay mounts inside one namespace. Each entry gets its own copy-on-write upper (or a direct/ro bind for rw/ro modes). bubblewrap applies mounts shallow-first, so a nested overlay (for example `/workspace` on top of a `/` root overlay) shadows its ancestors within its own subtree. Paths must be absolute, unique, and clean (no trailing slash, `.` or `..` segments); at most 16 mounts per session (including the legacy `workspace`). */
+            overlays?: components["schemas"]["IsolatedOverlaySpec"][];
             extra_writable?: string[];
             /** @description Additional host paths bind-mounted into the namespace with an explicit source-to-destination mapping. Unlike extra_writable (which mounts source==destination read-write), each entry may map a distinct destination path and be mounted read-only. The source path of every entry must fall within the configured writable allowlist. */
             binds?: components["schemas"]["BindMount"][];
@@ -1347,6 +1363,21 @@ export interface components {
             path: string;
             /** @enum {string} */
             mode?: "rw" | "overlay" | "ro";
+        };
+        /** @description One overlay mount inside the isolated namespace. `mode=overlay` mounts a copy-on-write view: with `persist=true` (default) writes land in a host upper directory tracked and usage-accounted by execd (the substrate for the diff/commit endpoints); with `persist=false` the upper is an ephemeral tmpfs whose writes are discarded when the session ends. `rw` and `ro` bind the host path directly; `persist` applies to overlay mode only and must be omitted for them (execd rejects the request otherwise). */
+        IsolatedOverlaySpec: {
+            /**
+             * @description Mount destination inside the namespace (absolute).
+             * @example /workspace
+             */
+            path: string;
+            /**
+             * @description Mount mode. Defaults to `overlay`.
+             * @enum {string}
+             */
+            mode?: "rw" | "overlay" | "ro";
+            /** @description Overlay mode only. When true (default; execd treats an omitted value as true) the copy-on-write upper is a host directory allocated per session; when false it is an ephemeral tmpfs whose writes are discarded when the session ends. Must be omitted for `rw` and `ro` modes (execd rejects the request otherwise). Because an ephemeral upper lives inside the namespace only, the filesystem API serves `persist=false` overlays from their host-side (lower) content: in-session writes under such an overlay are not observable through the files API and files-API writes into the overlay are rejected. Overlay mounts with `persist=false` also cannot host background-run logs, so background runs are rejected unless the first overlay is `rw` or `overlay` with `persist=true`. */
+            persist?: boolean;
         };
         BindMount: {
             /** @description Host path to bind-mount into the namespace. */
@@ -1400,10 +1431,11 @@ export interface components {
              *     level signals (for example the SIGINT sent when a foreground run
              *     times out or is cancelled) also reach them; execd cannot signal
              *     individual in-namespace processes.
-             *     Background runs require a writable log location, so sessions with
-             *     a read-only (`ro`) workspace reject them with 400: there is no
-             *     host-visible writable location for the run's log and exit-code
-             *     files. rw and overlay workspaces are supported.
+             *     Background runs require a writable log location under the first
+             *     overlay, so sessions whose first overlay is read-only (`ro`) or
+             *     an ephemeral overlay (`persist: false`) reject them with 400.
+             *     rw overlays and persistent (`persist: true`) overlays are
+             *     supported.
              * @example false
              */
             background?: boolean;
@@ -1461,7 +1493,7 @@ export interface components {
              */
             finished_at?: string | null;
         };
-        /** @description State of an isolated session. Runtime status fields (status, created_at, last_run_at, idle_remaining_seconds) are always present. Creation-parameter fields (profile, workspace, binds, share_net, env_passthrough, uid, gid, uid_mode, extra_writable, idle_timeout_seconds) echo the parameters used to create the session and let a stateless client rebuild a session handle from just a session ID (e.g. after a client restart or in serverless workers). Older execd builds may omit the creation-parameter fields; clients must tolerate them being absent. */
+        /** @description State of an isolated session. Runtime status fields (status, created_at, last_run_at, idle_remaining_seconds) are always present. Creation-parameter fields (profile, workspace, overlays, binds, share_net, env_passthrough, uid, gid, uid_mode, extra_writable, idle_timeout_seconds) echo the parameters used to create the session and let a stateless client rebuild a session handle from just a session ID (e.g. after a client restart or in serverless workers). `overlays` lists the effective mounts; for sessions created via the legacy `workspace` field it repeats that workspace as a single element, and `workspace` itself is only echoed for such single-overlay sessions. Older execd builds may omit the creation-parameter fields; clients must tolerate them being absent. */
         SessionState: {
             /** @enum {string} */
             status?: "active" | "dead" | "destroyed";
@@ -1476,6 +1508,8 @@ export interface components {
              */
             profile?: "strict" | "balanced";
             workspace?: components["schemas"]["IsolatedWorkspaceSpec"];
+            /** @description Effective overlay mounts of the session. */
+            overlays?: components["schemas"]["IsolatedOverlaySpec"][];
             extra_writable?: string[];
             binds?: components["schemas"]["BindMount"][];
             share_net?: boolean;
@@ -1786,8 +1820,11 @@ export interface operations {
         parameters: {
             query: {
                 /**
-                 * @description Session ID of the execution context to interrupt
-                 * @example session-123
+                 * @description Execution session ID of the running code execution to interrupt
+                 *     (the `init` event's id for the current run). Passing an unknown
+                 *     id fails loudly with a 500 "no such session" error; it is not
+                 *     silently ignored.
+                 * @example exec-123
                  */
                 id: string;
             };

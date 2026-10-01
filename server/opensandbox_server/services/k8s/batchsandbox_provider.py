@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import logging
 import json
 import shlex
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Callable, Dict, List, Any, Optional
 
 from opensandbox_server.config import (
     AppConfig,
@@ -97,8 +97,6 @@ def _merge_security_context(
 
 
 class BatchSandboxProvider(WorkloadProvider):
-    """Workload provider for BatchSandbox CRDs."""
-    
     def __init__(
         self,
         k8s_client: K8sClient,
@@ -127,7 +125,6 @@ class BatchSandboxProvider(WorkloadProvider):
         self.template_manager = BatchSandboxTemplateManager(template_file_path)
 
     def supports_image_auth(self) -> bool:
-        """BatchSandbox supports per-request image pull auth."""
         return True
 
     def create_workload(
@@ -268,6 +265,7 @@ class BatchSandboxProvider(WorkloadProvider):
             containers=containers,
             egress_settings=egress_settings,
             sandbox_id=sandbox_id,
+            pod_volumes=pod_spec["volumes"],
         )
 
         if volumes:
@@ -551,8 +549,19 @@ class BatchSandboxProvider(WorkloadProvider):
         }
 
 
+    def subscribe_workload(
+        self, sandbox_id: str, namespace: str, callback: Callable[[str, Dict[str, Any]], None]
+    ) -> Optional[Callable[[], None]]:
+        return self.k8s_client.subscribe_custom_objects(
+            group=self.group,
+            version=self.version,
+            namespace=namespace,
+            plural=self.plural,
+            names=[sandbox_id, self.legacy_resource_name(sandbox_id)],
+            callback=callback,
+        )
+
     def get_workload(self, sandbox_id: str, namespace: str) -> Optional[Dict[str, Any]]:
-        """Get BatchSandbox by sandbox ID."""
         workload = self.k8s_client.get_custom_object(
             group=self.group,
             version=self.version,
@@ -576,7 +585,6 @@ class BatchSandboxProvider(WorkloadProvider):
         return None
     
     def delete_workload(self, sandbox_id: str, namespace: str) -> None:
-        """Delete BatchSandbox workload."""
         batchsandbox = self.get_workload(sandbox_id, namespace)
         if not batchsandbox:
             raise Exception(f"BatchSandbox for sandbox {sandbox_id} not found")
@@ -591,11 +599,19 @@ class BatchSandboxProvider(WorkloadProvider):
         )
 
     def list_workloads(self, namespace: str, label_selector: str) -> List[Dict[str, Any]]:
-        """List BatchSandboxes matching label selector."""
         return self.k8s_client.list_custom_objects(
             group=self.group,
             version=self.version,
             namespace=namespace,
+            plural=self.plural,
+            label_selector=label_selector,
+        )
+
+    def list_workloads_all_namespaces(self, label_selector: str) -> List[Dict[str, Any]]:
+        """List BatchSandboxes across all namespaces matching the label selector."""
+        return self.k8s_client.list_custom_objects_all_namespaces(
+            group=self.group,
+            version=self.version,
             plural=self.plural,
             label_selector=label_selector,
         )
@@ -641,25 +657,21 @@ class BatchSandboxProvider(WorkloadProvider):
             current_pause = None if not current else current.get("spec", {}).get("pause")
             if current is not None and current_pause == target:
                 logger.warning(
-                    "BatchSandbox %s retry bridge target patch raised %s but read-back confirmed spec.pause=%s",
-                    sandbox_id,
-                    type(exc).__name__,
-                    target,
+                    f"BatchSandbox {sandbox_id} retry bridge target patch raised "
+                    f"{type(exc).__name__} but read-back confirmed spec.pause={target}"
                 )
                 return
 
             logger.warning(
-                "BatchSandbox %s retry bridge target patch raised %s and current spec.pause=%s; retrying target patch once",
-                sandbox_id,
-                type(exc).__name__,
-                current_pause,
+                f"BatchSandbox {sandbox_id} retry bridge target patch raised "
+                f"{type(exc).__name__} and current spec.pause={current_pause}; "
+                "retrying target patch once"
             )
             retried = self.patch_workload(sandbox_id, namespace, {"spec": {"pause": target}})
             if retried is None:
                 raise exc
 
     def update_expiration(self, sandbox_id: str, namespace: str, expires_at: datetime) -> None:
-        """Update BatchSandbox `spec.expireTime`."""
         batchsandbox = self.get_workload(sandbox_id, namespace)
         if not batchsandbox:
             raise Exception(f"BatchSandbox for sandbox {sandbox_id} not found")
@@ -720,10 +732,10 @@ class BatchSandboxProvider(WorkloadProvider):
 
         if pause_failed:
             self._patch_pause_with_retry_bridge(sandbox_id, namespace, True)
-            logger.info("Patched BatchSandbox %s retry bridge spec.pause=nil->true", sandbox_id)
+            logger.info(f"Patched BatchSandbox {sandbox_id} retry bridge spec.pause=nil->true")
         else:
             self.patch_workload(sandbox_id, namespace, {"spec": {"pause": True}})
-            logger.info("Patched BatchSandbox %s spec.pause=true", sandbox_id)
+            logger.info(f"Patched BatchSandbox {sandbox_id} spec.pause=true")
 
     def resume_sandbox(self, sandbox_id: str, namespace: str) -> None:
         """Resume a BatchSandbox by patching spec.pause=false.
@@ -770,10 +782,10 @@ class BatchSandboxProvider(WorkloadProvider):
 
         if resume_failed:
             self._patch_pause_with_retry_bridge(sandbox_id, namespace, False)
-            logger.info("Patched BatchSandbox %s retry bridge spec.pause=nil->false", sandbox_id)
+            logger.info(f"Patched BatchSandbox {sandbox_id} retry bridge spec.pause=nil->false")
         else:
             self.patch_workload(sandbox_id, namespace, {"spec": {"pause": False}})
-            logger.info("Patched BatchSandbox %s spec.pause=false", sandbox_id)
+            logger.info(f"Patched BatchSandbox {sandbox_id} spec.pause=false")
 
     def get_expiration(self, workload: Dict[str, Any]) -> Optional[datetime]:
         """Parse expiration timestamp from `spec.expireTime`."""

@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,10 +20,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 	"time"
 
-	"github.com/alibaba/opensandbox/execd/pkg/isolation"
 	"github.com/alibaba/opensandbox/execd/pkg/runtime"
 )
 
@@ -60,24 +58,7 @@ func RunHook(parent context.Context, hook Hook) Result {
 }
 
 func sanitizedHookEnvironment() []string {
-	blocked := make(map[string]struct{})
-	for _, name := range isolation.ExecdConfigEnvBlacklist() {
-		blocked[strings.ToUpper(name)] = struct{}{}
-	}
-
-	env := os.Environ()
-	filtered := make([]string, 0, len(env))
-	for _, entry := range env {
-		name, _, ok := strings.Cut(entry, "=")
-		if !ok {
-			continue
-		}
-		if _, found := blocked[strings.ToUpper(name)]; found {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-	return filtered
+	return runtime.UserProcessEnvironment()
 }
 
 func RunPreStart(ctx context.Context, cfg *Config) error {

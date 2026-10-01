@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,9 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +30,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/alibaba/opensandbox/execd/pkg/isolation"
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/internal/safego"
 )
@@ -85,10 +89,39 @@ func TestBashSession_NonZeroExitEmitsError(t *testing.T) {
 	}
 }
 
+func TestBashSession_RemovesScriptFile(t *testing.T) {
+	requireBash(t)
+	tmpDir := t.TempDir()
+	t.Setenv("TMPDIR", tmpDir)
+
+	session := newBashSession("", nil)
+	t.Cleanup(func() { _ = session.close() })
+	require.NoError(t, session.start())
+
+	for _, code := range []string{"exit 0", "exit 3"} {
+		var stdoutLines []string
+		require.NoError(t, session.run(context.Background(), &ExecuteCodeRequest{
+			// List the script first to prove it was created under tmpDir.
+			Code:    `ls "` + tmpDir + `"; ` + code,
+			Timeout: 3 * time.Second,
+			Hooks: ExecuteResultHook{
+				OnExecuteStdout: func(line string) { stdoutLines = append(stdoutLines, line) },
+			},
+		}))
+		require.True(t, slices.ContainsFunc(stdoutLines, func(line string) bool {
+			return strings.HasPrefix(line, "execd_bash_")
+		}), "script file was not created under TMPDIR: %v", stdoutLines)
+
+		leftover, err := filepath.Glob(filepath.Join(tmpDir, "execd_bash_*.sh"))
+		require.NoError(t, err)
+		require.Empty(t, leftover, "script file left behind after %q", code)
+	}
+}
+
 func TestBashSession_FallsBackToSh(t *testing.T) {
 	useShOnlyPath(t)
 
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 	require.NoError(t, session.start())
 
@@ -113,7 +146,7 @@ func TestBashSession_FallsBackToSh(t *testing.T) {
 func TestBashSession_FallsBackToSh_PersistsSingleQuotedValue(t *testing.T) {
 	useShOnlyPath(t)
 
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 	require.NoError(t, session.start())
 
@@ -209,10 +242,6 @@ func dashExportEscape(v string) string {
 	return b.String()
 }
 
-// TestParseExportLine_DashFormatRoundTrip verifies parseExportLine accepts
-// dash / BusyBox ash's exact export -p wire format across a range of values,
-// including ones that start or end with a single quote (which produce a
-// leading or trailing "'" segment rather than a wrapping ' ').
 func TestParseExportLine_DashFormatRoundTrip(t *testing.T) {
 	values := []string{
 		"",
@@ -271,7 +300,7 @@ func TestShellEscapeParseExportLine_RoundTrip(t *testing.T) {
 }
 
 func TestBashSession_envAndExitCode(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -296,7 +325,6 @@ func TestBashSession_envAndExitCode(t *testing.T) {
 		},
 	}
 
-	// 1) export an env var
 	request := &ExecuteCodeRequest{
 		Code:    "export FOO=hello",
 		Hooks:   hooks,
@@ -305,7 +333,6 @@ func TestBashSession_envAndExitCode(t *testing.T) {
 	require.NoError(t, session.run(context.Background(), request))
 	exportStdoutCount := len(stdoutLines)
 
-	// 2) verify env is persisted
 	request = &ExecuteCodeRequest{
 		Code:    "echo $FOO",
 		Hooks:   hooks,
@@ -322,7 +349,6 @@ func TestBashSession_envAndExitCode(t *testing.T) {
 	}
 	require.True(t, foundHello, "expected echo $FOO to output 'hello', got %v", echoLines)
 
-	// 3) ensure exit code of previous command is reflected in shell state
 	request = &ExecuteCodeRequest{
 		Code:    "false; echo EXIT:$?",
 		Hooks:   hooks,
@@ -344,7 +370,7 @@ func TestBashSession_envAndExitCode(t *testing.T) {
 }
 
 func TestBashSession_envLargeOutputChained(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -397,7 +423,7 @@ func TestBashSession_envLargeOutputChained(t *testing.T) {
 }
 
 func TestBashSession_cwdPersistsWithoutOverride(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -437,7 +463,7 @@ func TestBashSession_cwdPersistsWithoutOverride(t *testing.T) {
 }
 
 func TestBashSession_requestCwdOverridesAfterCd(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -458,7 +484,6 @@ func TestBashSession_requestCwdOverridesAfterCd(t *testing.T) {
 		return append([]string(nil), stdoutLines[start:]...)
 	}
 
-	// First request: change session cwd via script.
 	firstRunLines := runAndCollect(&ExecuteCodeRequest{
 		Code:    fmt.Sprintf("cd %s\npwd", initialDir),
 		Hooks:   hooks,
@@ -466,7 +491,6 @@ func TestBashSession_requestCwdOverridesAfterCd(t *testing.T) {
 	})
 	require.True(t, containsLine(firstRunLines, initialDir), "expected cd to update cwd to %q, got %v", initialDir, firstRunLines)
 
-	// Second request: explicit Cwd overrides session cwd.
 	secondRunLines := runAndCollect(&ExecuteCodeRequest{
 		Code:    "pwd",
 		Cwd:     overrideDir,
@@ -482,7 +506,7 @@ func TestBashSession_requestCwdOverridesAfterCd(t *testing.T) {
 }
 
 func TestBashSession_envDumpNotLeakedWhenNoTrailingNewline(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -510,7 +534,7 @@ func TestBashSession_envDumpNotLeakedWhenNoTrailingNewline(t *testing.T) {
 }
 
 func TestBashSession_envDumpNotLeakedWhenNoOutput(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -556,7 +580,6 @@ func TestBashSession_heredoc(t *testing.T) {
 		},
 	}
 
-	// First run: heredoc + reward file write.
 	script := fmt.Sprintf(`
 set -x
 reward_dir=%q
@@ -583,7 +606,6 @@ cat "$reward_dir/reward.txt"
 		Hooks:    hooks,
 	}))
 
-	// Second run: ensure the session keeps working.
 	require.NoError(t, controller.RunInBashSession(ctx, &ExecuteCodeRequest{
 		Context:  sessionID,
 		Language: Bash,
@@ -594,7 +616,7 @@ cat "$reward_dir/reward.txt"
 }
 
 func TestBashSession_execReplacesShell(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -634,7 +656,7 @@ exec /tmp/exec_child.sh
 }
 
 func TestBashSession_complexExec(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	t.Cleanup(func() { _ = session.close() })
 
 	require.NoError(t, session.start())
@@ -651,10 +673,13 @@ LOG_FILE=$(mktemp)
 export LOG_FILE
 exec 3>&1 4>&2
 exec > >(tee "$LOG_FILE") 2>&1
+tee_pid=$!
 
 set -x
 echo "from-complex-exec"
 exec 1>&3 2>&4 # step record
+# Drain the process substitution before the session captures its environment.
+wait "$tee_pid"
 echo "after-restore"
 `
 
@@ -666,7 +691,6 @@ echo "after-restore"
 	require.NoError(t, session.run(context.Background(), request), "expected complex exec to finish")
 	require.True(t, containsLine(stdoutLines, "from-complex-exec") && containsLine(stdoutLines, "after-restore"), "expected exec outputs, got %v", stdoutLines)
 
-	// Session should still be usable.
 	request = &ExecuteCodeRequest{
 		Code:    "echo still-alive",
 		Hooks:   hooks,
@@ -686,12 +710,10 @@ func containsLine(lines []string, target string) bool {
 	return false
 }
 
-// TestBashSession_CloseKillsRunningProcess verifies that session.close() kills the active
-// process group so that a long-running command (e.g. sleep) does not keep running after close.
 func TestBashSession_CloseKillsRunningProcess(t *testing.T) {
 	requireBash(t)
 
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	require.NoError(t, session.start())
 
 	runDone := make(chan error, 1)
@@ -713,14 +735,11 @@ func TestBashSession_CloseKillsRunningProcess(t *testing.T) {
 
 	select {
 	case <-runDone:
-		// run() returned; process was killed so we did not wait 30s
 	case <-time.After(3 * time.Second):
 		require.Fail(t, "run did not return within 3s after close (process was not killed)")
 	}
 }
 
-// TestBashSession_DeleteBashSessionKillsRunningProcess verifies that DeleteBashSession
-// (close path) kills the active run and removes the session from the controller.
 func TestBashSession_DeleteBashSessionKillsRunningProcess(t *testing.T) {
 	requireBash(t)
 
@@ -746,21 +765,17 @@ func TestBashSession_DeleteBashSessionKillsRunningProcess(t *testing.T) {
 
 	select {
 	case <-runDone:
-		// RunInBashSession returned; process was killed
 	case <-time.After(3 * time.Second):
 		require.Fail(t, "RunInBashSession did not return within 3s after DeleteBashSession")
 	}
 
-	// Session should be gone; deleting again should return ErrContextNotFound.
 	err = c.DeleteBashSession(sessionID)
 	require.Error(t, err)
 	require.ErrorIs(t, err, ErrContextNotFound)
 }
 
-// TestBashSession_CloseWithNoActiveRun verifies that close() with no running command
-// completes without error and does not hang.
 func TestBashSession_CloseWithNoActiveRun(t *testing.T) {
-	session := newBashSession("")
+	session := newBashSession("", nil)
 	require.NoError(t, session.start())
 
 	done := make(chan struct{}, 1)
@@ -771,8 +786,117 @@ func TestBashSession_CloseWithNoActiveRun(t *testing.T) {
 
 	select {
 	case <-done:
-		// close() returned
 	case <-time.After(2 * time.Second):
 		require.Fail(t, "close() did not return within 2s when no run was active")
 	}
+}
+
+func writeExecdEnvsFile(t *testing.T, lines ...string) string {
+	t.Helper()
+	envFile := filepath.Join(t.TempDir(), "env")
+	require.NoError(t, os.WriteFile(envFile, []byte(strings.Join(lines, "\n")), 0o644))
+	t.Setenv("EXECD_ENVS", envFile)
+	return envFile
+}
+
+func TestBashSession_ExecdEnvsFileAppliedToSession(t *testing.T) {
+	requireBash(t)
+
+	writeExecdEnvsFile(t, "SESSION_FOO=bar")
+
+	c := NewController("", "")
+	sessionID, err := c.CreateBashSession(&CreateContextRequest{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.DeleteBashSession(sessionID) })
+
+	var stdoutLines []string
+	require.NoError(t, c.RunInBashSession(context.Background(), &ExecuteCodeRequest{
+		Language: Bash,
+		Context:  sessionID,
+		Code:     `printf '%s\n' "$SESSION_FOO"`,
+		Timeout:  5 * time.Second,
+		Hooks: ExecuteResultHook{
+			OnExecuteStdout: func(line string) { stdoutLines = append(stdoutLines, line) },
+		},
+	}))
+	require.Contains(t, stdoutLines, "bar")
+}
+
+func TestBashSession_ExecdEnvsFileExpandsSessionCwd(t *testing.T) {
+	requireBash(t)
+
+	workspace := t.TempDir()
+	writeExecdEnvsFile(t, "SESSION_WORKSPACE="+workspace)
+
+	c := NewController("", "")
+	sessionID, err := c.CreateBashSession(&CreateContextRequest{Cwd: "$SESSION_WORKSPACE"})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.DeleteBashSession(sessionID) })
+
+	var stdoutLines []string
+	require.NoError(t, c.RunInBashSession(context.Background(), &ExecuteCodeRequest{
+		Language: Bash,
+		Context:  sessionID,
+		Code:     `pwd`,
+		Timeout:  5 * time.Second,
+		Hooks: ExecuteResultHook{
+			OnExecuteStdout: func(line string) { stdoutLines = append(stdoutLines, line) },
+		},
+	}))
+	require.Contains(t, stdoutLines, workspace)
+}
+
+func TestNewBashSessionEnvOverlaysFileAndKeepsBlacklist(t *testing.T) {
+	writeExecdEnvsFile(t, "SESSION_FOO=bar", "EXECD_ACCESS_TOKEN=leak", "EXECD_ENVS=/elsewhere")
+
+	env := newBashSessionEnv()
+	require.Equal(t, "bar", env["SESSION_FOO"])
+	for _, name := range isolation.ExecdConfigEnvBlacklist() {
+		require.NotContains(t, env, name, "blacklisted execd var %s must not enter the session env", name)
+	}
+}
+
+func TestBashSession_TimeoutKillsChildren(t *testing.T) {
+	requireBash(t)
+	marker := filepath.Join(t.TempDir(), "child.done")
+
+	session := newBashSession("", nil)
+	t.Cleanup(func() { _ = session.close() })
+	require.NoError(t, session.start())
+
+	start := time.Now()
+	err := session.run(context.Background(), &ExecuteCodeRequest{
+		// The subshell inherits stdout, so it keeps the output pipe open
+		// after bash itself is killed.
+		Code:    `(sleep 2; touch "` + marker + `")`,
+		Timeout: 300 * time.Millisecond,
+	})
+	require.ErrorContains(t, err, "timeout")
+	require.Less(t, time.Since(start), 1500*time.Millisecond, "run did not return at the timeout")
+
+	// Give a surviving child time to write the marker.
+	time.Sleep(2500 * time.Millisecond)
+	_, statErr := os.Stat(marker)
+	require.True(t, os.IsNotExist(statErr), "child survived the session run timeout")
+}
+
+// A run that finishes normally must not kill jobs it started in the
+// background; only a timeout or cancel does.
+func TestBashSession_NormalExitKeepsBackgroundJob(t *testing.T) {
+	requireBash(t)
+	marker := filepath.Join(t.TempDir(), "child.done")
+
+	session := newBashSession("", nil)
+	t.Cleanup(func() { _ = session.close() })
+	require.NoError(t, session.start())
+
+	require.NoError(t, session.run(context.Background(), &ExecuteCodeRequest{
+		Code:    `(sleep 1; touch "` + marker + `") >/dev/null 2>&1 &`,
+		Timeout: 10 * time.Second,
+	}))
+
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(marker)
+		return err == nil
+	}, 5*time.Second, 50*time.Millisecond, "background job was killed after a normal run")
 }

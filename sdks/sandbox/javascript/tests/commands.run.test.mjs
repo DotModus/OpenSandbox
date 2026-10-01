@@ -1,3 +1,17 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -253,3 +267,67 @@ test("execd client error message carries unstructured JSON error body", async ()
     },
   );
 });
+
+test("native argv preserves literals and execution options", async () => {
+  const argv = ["tool", "", "a b", "$HOME", "x'y", "中文"];
+  for (const background of [false, true]) {
+    let body;
+    const adapter = new CommandsAdapter({}, {
+      baseUrl: "http://localhost",
+      fetch: async (_url, init) => {
+        body = JSON.parse(init.body);
+        return new Response('data: {"type":"execution_complete"}\n\n', {headers: {"content-type": "text/event-stream"}});
+      },
+    });
+    await adapter.run(argv, {background, workingDirectory: "$DIR", envs: {DIR: "/tmp"}, timeoutSeconds: 2});
+    assert.deepEqual(body, {argv, background, cwd: "$DIR", envs: {DIR: "/tmp"}, timeout: 2000});
+    await assert.rejects(adapter.run([]), /argv/);
+    await assert.rejects(adapter.run(["tool", "\0"]), /argv/);
+  }
+});
+
+test("native argv rejects invalid inputs before transport", async () => {
+  const sparse = ["tool"];
+  sparse.length = 2;
+  let requests = 0;
+  const adapter = new CommandsAdapter({}, {
+    baseUrl: "http://localhost",
+    fetch: async () => { requests++; throw new Error("unexpected request"); },
+  });
+  for (const input of [null, 123, {0: "tool", length: 1}, sparse, [], [""], ["tool", null], ["tool", "\0"]]) {
+    await assert.rejects(adapter.run(input), /argv requires/);
+    await assert.rejects(async () => {
+      for await (const _ of adapter.runStream(input)) { /* consume */ }
+    }, /argv requires/);
+  }
+  assert.equal(requests, 0);
+});
+
+for (const failure of [false, true]) {
+  for (const lateOutput of [false, true]) {
+    test(`foreground drains and releases stream: failure=${failure}, lateOutput=${lateOutput}`, async () => {
+      const terminal = failure
+        ? {type: "error", error: {ename: "CommandExecError", evalue: "7", traceback: []}}
+        : {type: "execution_complete", execution_time: 1};
+      const output = [{type: "stdout", text: "tail"}, {type: "stderr", text: "error-tail"}];
+      const events = lateOutput ? [terminal, ...output] : [...output, terminal];
+      const chunks = events.flatMap((event) => {
+        const frame = new TextEncoder().encode(`data: ${JSON.stringify({...event, timestamp: 1})}\n\n`);
+        return [frame.slice(0, 7), frame.slice(7)];
+      });
+      let exhausted = false;
+      const stream = new ReadableStream({
+        pull(controller) {
+          if (chunks.length) controller.enqueue(chunks.shift());
+          else { exhausted = true; controller.close(); }
+        },
+      });
+      const execution = await createAdapter(stream).run("echo test");
+      assert.deepEqual(execution.logs.stdout.map((item) => item.text), ["tail"]);
+      assert.deepEqual(execution.logs.stderr.map((item) => item.text), ["error-tail"]);
+      assert.equal(execution.exitCode, failure ? 7 : 0);
+      assert.equal(exhausted, true);
+      assert.equal(stream.locked, false);
+    });
+  }
+}

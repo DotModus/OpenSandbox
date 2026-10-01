@@ -35,7 +35,7 @@ func main() {
     lc := opensandbox.NewLifecycleClient("http://localhost:8080/v1", "your-api-key")
 
     sbx, err := lc.CreateSandbox(ctx, opensandbox.CreateSandboxRequest{
-        Image:      opensandbox.ImageSpec{URI: "python:3.12"},
+        Image:      &opensandbox.ImageSpec{URI: "python:3.12"},
         Entrypoint: []string{"/bin/sh"},
         ResourceLimits: opensandbox.ResourceLimits{
             "cpu":    "500m",
@@ -71,11 +71,11 @@ func main() {
 ### Run a command with streaming output
 
 ```go
-exec := opensandbox.NewExecdClient("http://localhost:9090", "your-execd-token")
+exec := opensandbox.NewExecdClient("http://localhost:44772", "your-execd-token")
 
 err := exec.RunCommand(ctx, opensandbox.RunCommandRequest{
     Command: "echo 'Hello from sandbox!'",
-    Timeout: 30000,
+    Timeout: 30000, // milliseconds
 }, func(event opensandbox.StreamEvent) error {
     switch event.Event {
     case "stdout":
@@ -87,6 +87,102 @@ err := exec.RunCommand(ctx, opensandbox.RunCommandRequest{
     }
     return nil
 })
+```
+
+### Create and restore snapshots
+
+```go
+// Create a snapshot from a running sandbox, then wait until it is Ready
+mgr := opensandbox.NewSandboxManager(config)
+snap, err := mgr.CreateSnapshot(ctx, sandboxID, opensandbox.CreateSnapshotRequest{
+    Name: "pre-migration",
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+info, err := mgr.GetSnapshot(ctx, snap.ID)
+for err == nil && info.Status.State == opensandbox.SnapshotStateCreating {
+    select {
+    case <-ctx.Done():
+        log.Fatal(ctx.Err())
+    case <-time.After(2 * time.Second):
+        info, err = mgr.GetSnapshot(ctx, snap.ID)
+    }
+}
+if err != nil {
+    log.Fatal(err)
+}
+if info.Status.State != opensandbox.SnapshotStateReady {
+    log.Fatalf("snapshot not Ready: state=%s reason=%s", info.Status.State, info.Status.Reason)
+}
+
+page, err := mgr.ListSnapshots(ctx, opensandbox.ListSnapshotsOptions{})
+
+// Restore: create a new sandbox FROM a snapshot (Image and SnapshotID are
+// mutually exclusive — set exactly one)
+restored, err := lc.CreateSandbox(ctx, opensandbox.CreateSandboxRequest{
+    SnapshotID: snap.ID,
+    ResourceLimits: opensandbox.ResourceLimits{
+        "cpu":    "500m",
+        "memory": "512Mi",
+    },
+})
+if err != nil {
+    log.Fatal(err)
+}
+_ = restored
+
+// Only delete the snapshot after the restore has succeeded
+_ = mgr.DeleteSnapshot(ctx, snap.ID)
+```
+
+### Run code in an isolated session
+
+Isolated sessions run multi-step code in a hardened, resource-bounded
+environment with bind mounts — reachable through `Sandbox.IsolationCreate`:
+
+```go
+shareNet := true
+ephemeral := false
+session, err := sbx.IsolationCreate(ctx, opensandbox.CreateIsolatedSessionRequest{
+    // Workspace is a pointer; Overlays carries additional independent mounts.
+    Workspace: &opensandbox.IsolatedWorkspaceSpec{Path: "/workspace", Mode: "rw"},
+    Overlays: []opensandbox.IsolatedOverlaySpec{{
+        Path:    "/data/scratch",
+        Mode:    "overlay",
+        Persist: &ephemeral, // tmpfs upper: writes die with the session
+    }},
+    Profile:  "strict",
+    // Optional bind mounts (source on host, dest inside the session)
+    Binds:    []opensandbox.BindMount{{Source: "/data", Dest: "/data", ReadOnly: true}},
+    ShareNet: &shareNet,
+})
+
+// Foreground run — TimeoutSeconds applies here only; background runs are
+// deliberately not time-limited
+run, err := session.Run(ctx, opensandbox.IsolatedRunRequest{
+    Code:           "python -c 'print(1+1)'",
+    TimeoutSeconds: 30,
+}, nil)
+for _, out := range run.Stdout {
+    fmt.Println(out.Text)
+}
+
+// Background runs: start, poll until finished, then fetch logs
+bg, err := session.RunBackground(ctx, "make build")
+status, err := session.GetRunStatus(ctx, bg.RunID)
+for err == nil && status.Running {
+    select {
+    case <-ctx.Done():
+        log.Fatal(ctx.Err())
+    case <-time.After(2 * time.Second):
+        status, err = session.GetRunStatus(ctx, bg.RunID)
+    }
+}
+logs, _, err := session.GetRunLogs(ctx, bg.RunID, 0)
+
+_ = session.Delete(ctx)
 ```
 
 ### Check egress policy
@@ -110,7 +206,7 @@ logs. Create the sandbox with `CredentialProxy` enabled, then write credentials
 and bindings through the sandbox helpers or `EgressClient`.
 
 ```go
-sandbox, err := manager.Create(ctx, opensandbox.SandboxCreateOptions{
+sandbox, err := opensandbox.CreateSandbox(ctx, config, opensandbox.SandboxCreateOptions{
     Image: "python:3.11",
     NetworkPolicy: &opensandbox.NetworkPolicy{
         DefaultAction: "deny",
@@ -139,7 +235,6 @@ _, err = sandbox.CreateCredentialVault(ctx, opensandbox.CredentialVaultCreateReq
             Name: "api-token",
             Match: opensandbox.CredentialMatch{
                 Schemes: []opensandbox.CredentialScheme{opensandbox.CredentialSchemeHTTPS},
-                Ports:   []int{443},
                 Hosts:   []string{"api.example.com"},
                 Paths:   []string{"/v1/*"},
             },
@@ -179,9 +274,28 @@ Created with `NewLifecycleClient(baseURL, apiKey string, opts ...Option)`.
 | `DeleteSandbox(ctx, id)` | Delete a sandbox |
 | `PauseSandbox(ctx, id)` | Pause a running sandbox |
 | `ResumeSandbox(ctx, id)` | Resume a paused sandbox |
-| `RenewExpiration(ctx, id, expiresAt)` | Extend sandbox expiration time |
+| `RenewExpiration(ctx, id, expiresAt)` | Set sandbox expiration to a future timestamp (may shorten or extend) |
 | `GetEndpoint(ctx, sandboxID, port, useServerProxy)` | Get public endpoint for a sandbox port |
 | `GetSignedEndpoint(ctx, sandboxID, port, expires)` | Get signed endpoint URL with OSEP-0011 route token |
+| `PatchSandboxMetadata(ctx, id, patch)` | Add/remove sandbox metadata keys |
+| `CreateSnapshot(ctx, sandboxID, req)` | Create a snapshot of a sandbox |
+| `GetSnapshot(ctx, id)` | Get snapshot details by ID |
+| `ListSnapshots(ctx, opts)` | List snapshots with filtering and pagination |
+| `DeleteSnapshot(ctx, id)` | Delete a snapshot |
+| `CreateTemplate(ctx, req)` | Declare a fsb template (asynchronous build) |
+| `GetTemplate(ctx, id)` | Get template with latest build status |
+| `ListTemplates(ctx, opts)` | List templates with filtering and pagination |
+| `DeleteTemplate(ctx, id)` | Delete a template |
+| `GetNetworkPolicy(ctx, sandboxID)` | Get the network policy of a sandbox |
+| `PatchNetworkPolicy(ctx, sandboxID, rules)` | Merge rules into a sandbox's network policy |
+| `DeleteNetworkPolicyRules(ctx, sandboxID, targets)` | Remove rules from a sandbox's network policy |
+
+### SandboxManager
+
+Created with `NewSandboxManager(config ConnectionConfig)`. Administrative
+operations on sandboxes without connecting to a specific one; every method is a
+thin wrapper over the corresponding `LifecycleClient` call (see table above),
+plus `Close()`.
 
 ### ExecdClient
 
@@ -206,7 +320,7 @@ Created with `NewExecdClient(baseURL, accessToken string, opts ...Option)`.
 **Command Execution:**
 | Method | Description |
 |--------|-------------|
-| `CreateSession(ctx)` | Create a bash session |
+| `CreateSession(ctx, opts...)` | Create a bash session (optional `CreateSessionRequest` sets the working directory) |
 | `RunInSession(ctx, sessionID, req, handler)` | Run command in session with SSE |
 | `DeleteSession(ctx, sessionID)` | Delete a bash session |
 | `RunCommand(ctx, req, handler)` | Run a command with SSE streaming |
@@ -225,9 +339,10 @@ Created with `NewExecdClient(baseURL, accessToken string, opts ...Option)`.
 | `ListDirectory(ctx, path)` | List immediate directory contents (server-side default depth) |
 | `ListDirectoryWithDepth(ctx, path, depth)` | List directory contents up to the given depth (`0` returns empty) |
 | `ReplaceInFiles(ctx, req)` | Text replacement in files |
+| `ReplaceInFilesDetailed(ctx, req)` | Text replacement returning per-file replacement counts |
 | `UploadFile(ctx, file, opts)` | Upload a file to the sandbox |
 | `UploadFiles(ctx, entries)` | Upload multiple files to the sandbox |
-| `DownloadFile(ctx, remotePath, rangeHeader)` | Download a file from the sandbox |
+| `DownloadFile(ctx, remotePath, rangeHeader, opts...)` | Download a file from the sandbox (optional `DownloadFileOptions` reads by line) |
 
 **Directory Operations:**
 | Method | Description |

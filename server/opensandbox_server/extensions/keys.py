@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,11 +14,9 @@
 
 """Well-known CreateSandboxRequest.extensions keys and workload storage keys."""
 
-# access.renew.extend.seconds extension key (annotation-based)
 ACCESS_RENEW_EXTEND_SECONDS_KEY = "access.renew.extend.seconds"
 ACCESS_RENEW_EXTEND_SECONDS_METADATA_KEY = "opensandbox.io/access-renew-extend-seconds"
 
-# bootstrap.execd.isolation extension key
 # When set to "enable", the sandbox container receives CAP_SYS_ADMIN so that
 # execd can use bwrap namespace isolation (OSEP-0013).
 BOOTSTRAP_EXECD_ISOLATION_KEY = "bootstrap.execd.isolation"

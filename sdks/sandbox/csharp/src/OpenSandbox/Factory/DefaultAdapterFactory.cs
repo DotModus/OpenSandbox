@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -114,6 +114,21 @@ public sealed class DefaultAdapterFactory : IAdapterFactory
         {
             Egress = egress,
             CredentialVault = egress
+        };
+    }
+
+    /// <inheritdoc />
+    public NetworkPolicyStack CreateNetworkPolicyStack(CreateNetworkPolicyStackOptions options)
+    {
+        var clientWrapper = new HttpClientWrapper(
+            options.HttpClientProvider.HttpClient,
+            options.LifecycleBaseUrl,
+            options.ConnectionConfig.Headers,
+            options.LoggerFactory.CreateLogger("OpenSandbox.HttpClientWrapper"));
+
+        return new NetworkPolicyStack
+        {
+            Egress = new NetworkPolicyAdapter(clientWrapper, options.SandboxId)
         };
     }
 

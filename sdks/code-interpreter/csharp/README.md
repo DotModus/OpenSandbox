@@ -10,7 +10,7 @@ This SDK requires a Docker image containing the Code Interpreter runtime environ
 Node.js, and others.
 
 For supported languages and versions, see the
-[Environment Documentation](../../../sandboxes/code-interpreter/README.md).
+[Environment Documentation](https://github.com/opensandbox-group/sandbox-images).
 
 ## Installation
 
@@ -322,7 +322,7 @@ Console.WriteLine($"CPU: {metrics.CpuUsedPercentage}%, Memory: {metrics.MemoryUs
 
 - **Lifecycle**: `CodeInterpreter` wraps an existing `Sandbox` and reuses its connection and services.
 - **Default context behavior**: `RunAsync(..., new RunCodeOptions { Language = ... })` uses the language default context.
-- **Cleanup**: `DisposeAsync` only cleans local resources. Call `KillAsync()` to terminate the remote sandbox instance.
+- **Cleanup**: `CodeInterpreter` itself implements no `DisposeAsync`/`IAsyncDisposable`; local resources live on the wrapped `Sandbox` (it is `IAsyncDisposable`). Call `KillAsync()` to terminate the remote sandbox instance.
 
 ## License
 

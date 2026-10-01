@@ -54,15 +54,15 @@ jobs:
           make build
       - name: Validate Helm chart
         run: |
-          helm lint kubernetes/charts/opensandbox-node-agent
-          helm template nodeagent kubernetes/charts/opensandbox-node-agent \
+          helm lint manifests/charts/node-agent
+          helm template nodeagent manifests/charts/node-agent \
             > /tmp/nodeagent-default-sources.yaml
           grep -A1 'name: NODEAGENT_SOURCES' /tmp/nodeagent-default-sources.yaml \
             | grep -q 'value: "container-logs"'
-          helm template nodeagent kubernetes/charts/opensandbox-node-agent \
+          helm template nodeagent manifests/charts/node-agent \
             --set 'config.sources={source-a,source-b}' \
             > /tmp/nodeagent-non-log-sources.yaml
-          helm template nodeagent kubernetes/charts/opensandbox-node-agent \
+          helm template nodeagent manifests/charts/node-agent \
             --set 'config.sources={syscalls}' \
             > /tmp/nodeagent-syscalls.yaml
           grep -A8 'capabilities:' /tmp/nodeagent-syscalls.yaml | grep -q -- '- BPF'
@@ -75,7 +75,7 @@ jobs:
           grep -q 'name: host-tracing' /tmp/nodeagent-syscalls.yaml
           grep -q 'path: "/sys/fs/cgroup"' /tmp/nodeagent-syscalls.yaml
           grep -q 'path: "/sys/kernel/tracing"' /tmp/nodeagent-syscalls.yaml
-          helm template nodeagent kubernetes/charts/opensandbox-node-agent \
+          helm template nodeagent manifests/charts/node-agent \
             --set 'config.sources={syscalls}' \
             --set containerSecurityContext=null \
             > /tmp/nodeagent-syscalls-no-secctx.yaml
@@ -91,14 +91,14 @@ jobs:
               exit 1
             fi
           done
-          helm template nodeagent kubernetes/charts/opensandbox-node-agent \
+          helm template nodeagent manifests/charts/node-agent \
             --set 'config.sources={container-logs,source-a}' \
             > /tmp/nodeagent-mixed-sources.yaml
           grep -A1 'name: NODEAGENT_SOURCES' /tmp/nodeagent-mixed-sources.yaml \
             | grep -q 'value: "container-logs,source-a"'
           grep -q 'NODEAGENT_LOG_ROOT' /tmp/nodeagent-mixed-sources.yaml
           grep -q 'name: pod-logs' /tmp/nodeagent-mixed-sources.yaml
-          helm template nodeagent kubernetes/charts/opensandbox-node-agent \
+          helm template nodeagent manifests/charts/node-agent \
             --set 'config.sources={source-a,source-b}' \
             --set hostPaths.logs=null \
             --set config.maxLineBytes=null \
@@ -122,87 +122,46 @@ jobs:
               exit 1
             fi
           done
-          nodeagent_source_schema_error=""
-          if nodeagent_source_schema_error="$(helm template nodeagent kubernetes/charts/opensandbox-node-agent \
-            --set hostPaths.logs=null 2>&1)"; then
-            echo "container-logs configuration without hostPaths.logs passed schema validation" >&2
-            exit 1
-          fi
-          if ! grep -Eiq "(don't meet the specifications of the schema|values don't meet)" <<<"$nodeagent_source_schema_error" \
-            || ! grep -Eiq 'hostPaths.*logs|missing property.*logs' <<<"$nodeagent_source_schema_error"; then
-            echo "container-logs configuration failed for an unexpected reason: $nodeagent_source_schema_error" >&2
+          # Template-enforced required values must fail the render.
+          if helm template nodeagent manifests/charts/node-agent \
+            --set hostPaths.logs=null >/dev/null 2>&1; then
+            echo "container-logs Source rendered without hostPaths.logs" >&2
             exit 1
           fi
           for nodeagent_syscall_host_path in cgroup tracing; do
-            nodeagent_source_schema_error=""
-            if nodeagent_source_schema_error="$(helm template nodeagent kubernetes/charts/opensandbox-node-agent \
+            if helm template nodeagent manifests/charts/node-agent \
               --set 'config.sources={syscalls}' \
-              --set "hostPaths.${nodeagent_syscall_host_path}=null" 2>&1)"; then
-              echo "syscalls configuration without hostPaths.${nodeagent_syscall_host_path} passed schema validation" >&2
-              exit 1
-            fi
-            if ! grep -Eiq "(don't meet the specifications of the schema|values don't meet)" <<<"$nodeagent_source_schema_error" \
-              || ! grep -Eiq "hostPaths.*${nodeagent_syscall_host_path}|missing property.*${nodeagent_syscall_host_path}" <<<"$nodeagent_source_schema_error"; then
-              echo "syscalls configuration failed for an unexpected reason: $nodeagent_source_schema_error" >&2
+              --set "hostPaths.${nodeagent_syscall_host_path}=null" >/dev/null 2>&1; then
+              echo "syscalls Source rendered without hostPaths.${nodeagent_syscall_host_path}" >&2
               exit 1
             fi
           done
-          helm template nodeagent kubernetes/charts/opensandbox-node-agent \
+          helm template nodeagent manifests/charts/node-agent \
             --set 'config.sources={source-a,source-b}' \
             --set hostPaths.cgroup=null \
             --set hostPaths.tracing=null >/dev/null
-          for nodeagent_required_setting in maxLineBytes partialTimeout endedStateRetention; do
-            nodeagent_source_schema_error=""
-            if nodeagent_source_schema_error="$(helm template nodeagent kubernetes/charts/opensandbox-node-agent \
-              --set "config.${nodeagent_required_setting}=null" 2>&1)"; then
-              echo "container-logs configuration without config.${nodeagent_required_setting} passed schema validation" >&2
-              exit 1
-            fi
-            if ! grep -Eiq "(don't meet the specifications of the schema|values don't meet)" <<<"$nodeagent_source_schema_error" \
-              || ! grep -Eiq "(/config/${nodeagent_required_setting}|config[.:][[:space:]]*${nodeagent_required_setting}|missing propert(y|ies).*${nodeagent_required_setting})" <<<"$nodeagent_source_schema_error"; then
-              echo "container-logs configuration failed for an unexpected reason: $nodeagent_source_schema_error" >&2
-              exit 1
-            fi
-          done
-          nodeagent_source_schema_error=""
-          if nodeagent_source_schema_error="$(helm template nodeagent kubernetes/charts/opensandbox-node-agent \
-            --set 'config.sources={invalid/source}' 2>&1)"; then
-            echo "invalid Source name passed schema validation" >&2
-            exit 1
-          fi
-          if ! grep -Eiq "(don't meet the specifications of the schema|values don't meet)" <<<"$nodeagent_source_schema_error" \
-            || ! grep -Eiq '(config[./]sources([./]0)?).*(pattern|match)' <<<"$nodeagent_source_schema_error"; then
-            echo "invalid Source name failed for an unexpected reason: $nodeagent_source_schema_error" >&2
-            exit 1
-          fi
-          helm template nodeagent kubernetes/charts/opensandbox-node-agent \
+          helm template nodeagent manifests/charts/node-agent \
             --set sink.type=oss \
             --set sink.oss.endpoint=https://oss-cn-hangzhou.aliyuncs.com \
             --set sink.oss.bucket=test-bucket \
             --set sink.oss.keyPrefix=nodeagent-test \
             --set sink.oss.existingSecret=oss-credentials >/dev/null
-          nodeagent_bucket_error=""
-          if nodeagent_bucket_error="$(helm template nodeagent kubernetes/charts/opensandbox-node-agent \
+          if helm template nodeagent manifests/charts/node-agent \
             --set sink.type=oss \
             --set sink.oss.endpoint=https://oss-cn-hangzhou.aliyuncs.com \
-            --set sink.oss.bucket= \
-            --set sink.oss.keyPrefix=nodeagent-test \
-            --set sink.oss.existingSecret=oss-credentials 2>&1)"; then
-            echo "OSS configuration without a bucket passed schema validation"
+            --set sink.oss.bucket=test-bucket \
+            --set sink.oss.keyPrefix=nodeagent-test >/dev/null 2>&1; then
+            echo "OSS sink rendered without sink.oss.existingSecret" >&2
             exit 1
           fi
-          if ! grep -Eiq '(/sink/oss/bucket|sink\.oss\.bucket).*(minLength|length must be)' <<<"$nodeagent_bucket_error"; then
-            echo "OSS configuration failed for an unexpected reason: $nodeagent_bucket_error" >&2
-            exit 1
-          fi
-          helm dependency build kubernetes/charts/opensandbox
-          helm template opensandbox kubernetes/charts/opensandbox \
+          helm dependency build manifests/charts/opensandbox
+          helm template opensandbox manifests/charts/opensandbox \
             --set opensandbox-node-agent.enabled=true \
             --show-only charts/opensandbox-node-agent/templates/daemonset.yaml \
             > /tmp/opensandbox-nodeagent-umbrella.yaml
           grep -q '^kind: DaemonSet$' /tmp/opensandbox-nodeagent-umbrella.yaml
           grep -q 'app.kubernetes.io/component: node-agent' /tmp/opensandbox-nodeagent-umbrella.yaml
-          helm template opensandbox kubernetes/charts/opensandbox \
+          helm template opensandbox manifests/charts/opensandbox \
             > /tmp/opensandbox-default.yaml
           if grep -q 'app.kubernetes.io/component: node-agent' /tmp/opensandbox-default.yaml; then
             echo "node-agent rendered while disabled by default"

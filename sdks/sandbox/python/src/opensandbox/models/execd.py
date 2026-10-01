@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -233,9 +233,12 @@ class ExecutionHandlers(BaseModel):
             # Can perform async operations
             await log_to_database(msg.text)
 
+        async def handle_stderr(msg: OutputMessage):
+            print(f"Error: {msg.text}")
+
         handlers = ExecutionHandlers(
             on_stdout=handle_stdout,
-            on_stderr=lambda msg: print(f"Error: {msg.text}"),
+            on_stderr=handle_stderr,
         )
         ```
     """

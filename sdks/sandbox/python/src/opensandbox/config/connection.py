@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ from pydantic import (  # type: ignore[reportMissingImports]
     field_validator,
 )
 
+from opensandbox._httpx import AsyncEventHook
 from opensandbox.transport import RetryAsyncTransport, RetryPolicy
 
 
@@ -67,10 +68,25 @@ class ConnectionConfig(BaseModel):
         default=False, description="Enable debug logging for HTTP requests"
     )
     user_agent: str = Field(
-        default="OpenSandbox-Python-SDK/0.1.17.dev0", description="User agent string"
+        default="OpenSandbox-Python-SDK/1.1.0", description="User agent string"
     )
     headers: dict[str, str] = Field(
         default_factory=dict, description="User defined headers"
+    )
+    follow_redirects: bool = Field(
+        default=False,
+        description=(
+            "Whether HTTP clients should follow redirects. Cross-origin redirects strip "
+            "headers prefixed OPEN-SANDBOX- or OPENSANDBOX-, but other sensitive custom "
+            "headers may still be forwarded."
+        ),
+    )
+    event_hooks: dict[str, list[AsyncEventHook]] = Field(
+        default_factory=dict,
+        description=(
+            "Additional httpx event hooks for SDK-created async clients. SDK security "
+            "hooks run after configured request hooks."
+        ),
     )
     transport: httpx.AsyncBaseTransport | None = Field(
         default=None,
@@ -115,6 +131,10 @@ class ConnectionConfig(BaseModel):
             "Also honored via OPENSANDBOX_DISABLE_METRICS=1."
         ),
     )
+    enable_tracing: bool = Field(
+        default=False,
+        description="Enable OpenTelemetry tracing for SDK operations.",
+    )
 
     # Environment variable names
     _ENV_API_KEY = "OPEN_SANDBOX_API_KEY"
@@ -132,7 +152,43 @@ class ConnectionConfig(BaseModel):
 
         client_ip.apply_client_ip(self.headers)
 
-    def with_transport_if_missing(self) -> "ConnectionConfig":
+    @property
+    def owns_transport(self) -> bool:
+        """True when this config created (and may close) its transport."""
+        return self._owns_transport
+
+    def new_owned_transport(
+        self,
+        *,
+        max_connections: int | None = 100,
+        max_keepalive_connections: int = 20,
+        keepalive_expiry: float = 30.0,
+    ) -> httpx.AsyncBaseTransport:
+        """
+        Build a fresh transport stack owned by the caller.
+
+        Same stack as `with_transport_if_missing` builds by default; the
+        shared `transport` on this config is never touched. Callers that
+        close what they build (e.g. adapter clients) can do so safely.
+        """
+        inner = httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+                keepalive_expiry=keepalive_expiry,
+            ),
+        )
+        if self.retry_policy.wraps_transport():
+            return RetryAsyncTransport(inner, self.retry_policy, owns_inner=True)
+        return inner
+
+    def with_transport_if_missing(
+        self,
+        *,
+        max_connections: int | None = 100,
+        max_keepalive_connections: int = 20,
+        keepalive_expiry: float = 30.0,
+    ) -> "ConnectionConfig":
         """
         Ensure a transport exists for this SDK resource.
 
@@ -144,21 +200,15 @@ class ConnectionConfig(BaseModel):
         """
         if self.transport is not None:
             return self
-        inner = httpx.AsyncHTTPTransport(
-            limits=httpx.Limits(
-                max_connections=100,
-                max_keepalive_connections=20,
-                keepalive_expiry=30.0,
-            ),
+        config = self.model_copy(
+            update={
+                "transport": self.new_owned_transport(
+                    max_connections=max_connections,
+                    max_keepalive_connections=max_keepalive_connections,
+                    keepalive_expiry=keepalive_expiry,
+                )
+            }
         )
-        wrapped: httpx.AsyncBaseTransport
-        if self.retry_policy.wraps_transport():
-            wrapped = RetryAsyncTransport(
-                inner, self.retry_policy, owns_inner=True
-            )
-        else:
-            wrapped = inner
-        config = self.model_copy(update={"transport": wrapped})
         config._owns_transport = True
         return config
 
@@ -205,8 +255,6 @@ class ConnectionConfig(BaseModel):
         """Get the full base URL for API requests."""
         domain = self.get_domain()
         # Allow domain to override protocol if it explicitly starts with a scheme
-        if domain.startswith("http://") or domain.startswith(
-            "https://"
-        ):
+        if domain.startswith("http://") or domain.startswith("https://"):
             return f"{domain}/{self._API_VERSION}"
         return f"{self.protocol}://{domain}/{self._API_VERSION}"

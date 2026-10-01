@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -114,6 +114,10 @@ func applyBatchSandboxPhaseConditions(status *sandboxv1alpha1.BatchSandboxStatus
 }
 
 func getPodFailureReasonAndMessage(pod *corev1.Pod) (string, string, bool) {
+	// Deleting pods no longer contribute new runtime failures, including waiting states.
+	if pod.DeletionTimestamp != nil {
+		return "", "", false
+	}
 	if reason, message, failed := getTerminalPodFailureReasonAndMessage(pod); failed {
 		return reason, message, true
 	}
@@ -130,28 +134,67 @@ func getPodFailureReasonAndMessage(pod *corev1.Pod) (string, string, bool) {
 }
 
 func getTerminalPodFailureReasonAndMessage(pod *corev1.Pod) (string, string, bool) {
-	if pod.Status.Phase != corev1.PodFailed {
+	// Kubernetes may publish a terminal failure while deleting an old runtime pod.
+	// Ignore it for new failure attribution; already recorded sandbox failures remain terminal.
+	if pod.DeletionTimestamp != nil {
 		return "", "", false
 	}
-	for i := range pod.Status.InitContainerStatuses {
-		if reason, message, failed := terminatedContainerFailure(pod, &pod.Status.InitContainerStatuses[i], true); failed {
-			return reason, message, true
+	if pod.Status.Phase == corev1.PodFailed {
+		for i := range pod.Status.InitContainerStatuses {
+			if reason, message, failed := terminatedContainerFailure(pod, &pod.Status.InitContainerStatuses[i], true); failed {
+				return reason, message, true
+			}
 		}
-	}
-	for i := range pod.Status.ContainerStatuses {
-		if reason, message, failed := terminatedContainerFailure(pod, &pod.Status.ContainerStatuses[i], false); failed {
-			return reason, message, true
+		for i := range pod.Status.ContainerStatuses {
+			if reason, message, failed := terminatedContainerFailure(pod, &pod.Status.ContainerStatuses[i], false); failed {
+				return reason, message, true
+			}
 		}
+
+		message := fmt.Sprintf("Pod %s entered Failed phase", pod.Name)
+		if pod.Status.Reason != "" {
+			message += fmt.Sprintf(" (%s)", pod.Status.Reason)
+		}
+		if pod.Status.Message != "" {
+			message += ": " + pod.Status.Message
+		}
+		return terminalPodFailedReason, message, true
 	}
 
-	message := fmt.Sprintf("Pod %s entered Failed phase", pod.Name)
-	if pod.Status.Reason != "" {
-		message += fmt.Sprintf(" (%s)", pod.Status.Reason)
+	// A Running pod can be terminal even before Kubernetes flips its phase: when
+	// the restart policy is Never and the main container (the first regular
+	// container, matching the server-side convention) has already terminated with
+	// a non-zero exit code, no restart will bring the sandbox runtime back.
+	// This matters for multi-container pods (for example an egress sidecar keeps
+	// the pod Running) that would otherwise never reach the PodFailed phase.
+	if reason, message, failed := terminatedMainContainerFailure(pod); failed {
+		return reason, message, true
 	}
-	if pod.Status.Message != "" {
-		message += ": " + pod.Status.Message
+	return "", "", false
+}
+
+// terminatedMainContainerFailure reports whether the sandbox's main container
+// terminated with a non-zero exit code under a restart policy that will not
+// restart it (Never). RestartPolicyAlways and RestartPolicyOnFailure pods are
+// excluded because the kubelet restarts the container instead. Pods that are
+// already terminating are excluded too: deletion, eviction, or node drain may
+// signal-kill the main container, and the resulting non-zero exit must not turn
+// into a sticky terminal failure that blocks replacement of the deleted pod.
+func terminatedMainContainerFailure(pod *corev1.Pod) (string, string, bool) {
+	if pod.DeletionTimestamp != nil ||
+		pod.Spec.RestartPolicy != corev1.RestartPolicyNever ||
+		len(pod.Spec.Containers) == 0 {
+		return "", "", false
 	}
-	return terminalPodFailedReason, message, true
+	mainName := pod.Spec.Containers[0].Name
+	for i := range pod.Status.ContainerStatuses {
+		status := &pod.Status.ContainerStatuses[i]
+		if status.Name != mainName {
+			continue
+		}
+		return terminatedContainerFailure(pod, status, false)
+	}
+	return "", "", false
 }
 
 func terminatedContainerFailure(pod *corev1.Pod, status *corev1.ContainerStatus, initContainer bool) (string, string, bool) {
@@ -301,7 +344,7 @@ func applyResumingRuntimePhase(status *sandboxv1alpha1.BatchSandboxStatus, pods 
 func applySteadyRuntimePhase(batchSbx *sandboxv1alpha1.BatchSandbox, status *sandboxv1alpha1.BatchSandboxStatus, pods []*corev1.Pod) {
 	summary, hasFailures := summarizePodFailures(pods)
 	if batchSbx.Status.Phase == "" || batchSbx.Status.Phase == sandboxv1alpha1.BatchSandboxPhasePending {
-		summary, hasFailures = summarizeTerminalPodFailures(pods)
+		summary, hasFailures = summarizeTerminalPodFailures(excludeAdmissionRecovery(pods))
 	}
 	if hasFailures {
 		if batchSbx.Status.Phase != sandboxv1alpha1.BatchSandboxPhaseFailed {
@@ -326,6 +369,19 @@ func applySteadyRuntimePhase(batchSbx *sandboxv1alpha1.BatchSandbox, status *san
 		return
 	}
 	status.Phase = sandboxv1alpha1.BatchSandboxPhasePending
+}
+
+// excludeAdmissionRecovery drops pods recoverable by pod recovery, so stuck
+// kubelet admission rejections do not freeze a never-Ready sandbox.
+func excludeAdmissionRecovery(pods []*corev1.Pod) []*corev1.Pod {
+	filtered := make([]*corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if isRecoverableAdmissionFailure(pod) {
+			continue
+		}
+		filtered = append(filtered, pod)
+	}
+	return filtered
 }
 
 func hasTerminalPodFailureCondition(conditions []sandboxv1alpha1.BatchSandboxCondition) bool {
@@ -412,12 +468,12 @@ func (r *BatchSandboxReconciler) persistRuntimeView(
 
 func (r *BatchSandboxReconciler) patchBatchSandboxEndpoints(ctx context.Context, batchSbx *sandboxv1alpha1.BatchSandbox, endpointIPs []string) error {
 	raw, _ := json.Marshal(endpointIPs)
-	if batchSbx.Annotations[AnnotationSandboxEndpoints] == string(raw) {
+	if batchSbx.Annotations[annotationSandboxEndpoints] == string(raw) {
 		return nil
 	}
 	// Skip writing empty endpoints when annotation doesn't exist yet (e.g. sandbox just created, no pods assigned).
 	// Still allow clearing endpoints when annotation was previously set (e.g. pause scenario).
-	_, annotationExists := batchSbx.Annotations[AnnotationSandboxEndpoints]
+	_, annotationExists := batchSbx.Annotations[annotationSandboxEndpoints]
 	if !annotationExists && string(raw) == "[]" {
 		return nil
 	}
@@ -425,7 +481,7 @@ func (r *BatchSandboxReconciler) patchBatchSandboxEndpoints(ctx context.Context,
 	patchData, _ := json.Marshal(map[string]any{
 		"metadata": map[string]any{
 			"annotations": map[string]string{
-				AnnotationSandboxEndpoints: string(raw),
+				annotationSandboxEndpoints: string(raw),
 			},
 		},
 	})

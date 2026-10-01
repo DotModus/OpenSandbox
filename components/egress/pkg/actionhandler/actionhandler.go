@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 //
 // The package owns the wire model, parsing, and validation only. Lifecycle
 // semantics (deny-first registration, data-plane-ready activation) are wired
-// by the fleet control plane (package main).
+// by the fast-sandbox control plane (package main).
 //
 // Fail-closed rules:
 //   - An unknown apiVersion, operation, Hook name, or malformed envelope is a

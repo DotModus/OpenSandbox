@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ func RecordIsolatedRun(ctx context.Context, result string, durationMillis float6
 	if isolationRunDurationMs == nil {
 		return
 	}
-	attrs := append([]attribute.KeyValue{}, execdSharedAttrs()...)
+	attrs := append([]attribute.KeyValue{}, sharedAttrs()...)
 	attrs = append(attrs, attribute.String("result", result))
 	isolationRunDurationMs.Record(ctx, durationMillis, metric.WithAttributes(attrs...))
 }

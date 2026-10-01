@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -258,7 +258,6 @@ func (*lifecycleTestLifecycle) DrainError() error            { return nil }
 func (*lifecycleTestLifecycle) ExitCode() (int, bool)        { return 0, true }
 func (l *lifecycleTestLifecycle) Close() error               { return nil }
 
-// Exercises the background run endpoints end to end: start, poll status, read logs.
 func TestBackgroundRun_HTTPFlow(t *testing.T) {
 	previousRunner := isolatedRunner
 	runner, err := runtime.NewIsolatedRunner(
@@ -384,7 +383,6 @@ func TestBackgroundRun_HTTPFlow(t *testing.T) {
 	_ = cursor
 }
 
-// Unknown sessions and run IDs 404 on the background run endpoints.
 func TestBackgroundRun_Endpoints404(t *testing.T) {
 	previousRunner := isolatedRunner
 	runner, err := runtime.NewIsolatedRunner(

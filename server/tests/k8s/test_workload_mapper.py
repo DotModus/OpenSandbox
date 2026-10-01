@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -226,7 +226,6 @@ class TestExtractPlatformFromWorkload:
             },
             "status": {"replicas": 1, "ready": 1, "allocated": 1},
         }
-        # Should return None (no platform info), not raise.
         assert _extract_platform_from_workload(workload) is None
 
     def test_pool_mode_workload_without_template_key_returns_none(self):

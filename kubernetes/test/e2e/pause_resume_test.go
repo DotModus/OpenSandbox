@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -163,7 +163,7 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 	})
 
 	Context("Pause and Resume", func() {
-		It("should complete the full pause-resume flow via spec.pause trigger", func() {
+		DescribeTable("should complete the full pause-resume flow via spec.pause trigger", func(waitForDeletion bool) {
 			const sandboxName = "test-pause-resume"
 
 			// --- Step 1: Create BatchSandbox ---
@@ -227,6 +227,11 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				}
 			}
 			Expect(podName).NotTo(BeEmpty(), "Should find a pod owned by BatchSandbox")
+			cmd = exec.Command("kubectl", "get", "pod", podName, "-n", pauseResumeNamespace,
+				"-o", "jsonpath={.metadata.uid}")
+			oldUID, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(oldUID).NotTo(BeEmpty())
 
 			markerValue := fmt.Sprintf("pause-test-%d", time.Now().UnixNano())
 			By("writing marker file into container for rootfs verification")
@@ -243,7 +248,7 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 
-			By("waiting for BatchSandbox phase to be Paused (snapshot ready, pods deleted)")
+			By("waiting for BatchSandbox phase to be Paused (snapshot ready, pod deletion requested)")
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "get", "batchsandbox", sandboxName,
 					"-n", pauseResumeNamespace, "-o", "jsonpath={.status.phase}")
@@ -252,18 +257,21 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				g.Expect(output).To(Equal("Paused"))
 			}, 3*time.Minute).Should(Succeed())
 
-			// Verify pods are deleted
-			By("verifying pods are deleted after pause")
-			cmd = exec.Command("kubectl", "get", "pods", "-n", pauseResumeNamespace,
-				"-l", "batchsandbox-name="+sandboxName, "-o", "name")
-			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(output).To(BeEmpty(), "Pods should be deleted after pause")
+			if waitForDeletion {
+				By("waiting for pods to be deleted after pause")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "pods", "-n", pauseResumeNamespace,
+						"-l", "batch-sandbox.sandbox.opensandbox.io/name="+sandboxName, "-o", "name")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).To(BeEmpty(), "Pods should eventually be deleted after pause")
+				}, time.Minute).Should(Succeed())
+			}
 
 			By("verifying the reserved internal SandboxSnapshot exists after pause")
 			cmd = exec.Command("kubectl", "get", "sandboxsnapshot", sandboxName+"-pause",
 				"-n", pauseResumeNamespace, "-o", "jsonpath={.status.phase}")
-			output, err = utils.Run(cmd)
+			output, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(output).To(Equal("Succeed"), "Internal pause snapshot should be ready after pause")
 
@@ -274,6 +282,17 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				"-p", `{"spec":{"pause":false}}`)
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred())
+
+			if !waitForDeletion {
+				By("proving resume was submitted while the old pod was still terminating")
+				cmd = exec.Command("kubectl", "get", "pod", podName, "-n", pauseResumeNamespace,
+					"-o", "jsonpath={.metadata.uid} {.metadata.deletionTimestamp}")
+				output, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "Race coverage missing: old pod disappeared before confirmation")
+				fields := strings.Fields(output)
+				Expect(fields).To(HaveLen(2), "Race coverage missing: old pod must be terminating")
+				Expect(fields[0]).To(Equal(oldUID), "Race coverage missing: pod was already replaced")
+			}
 
 			By("waiting for resumed BatchSandbox to return to Succeed")
 			Eventually(func(g Gomega) {
@@ -323,6 +342,12 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 				}
 			}
 			Expect(resumedPodName).NotTo(BeEmpty(), "Should find a pod owned by resumed BatchSandbox")
+			cmd = exec.Command("kubectl", "get", "pod", resumedPodName, "-n", pauseResumeNamespace,
+				"-o", "jsonpath={.metadata.uid}")
+			newUID, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(newUID).NotTo(BeEmpty())
+			Expect(newUID).NotTo(Equal(oldUID), "Resume must create a replacement pod")
 
 			By("reading marker file from resumed container to verify rootfs persistence")
 			cmd = exec.Command("kubectl", "exec", resumedPodName, "-n", pauseResumeNamespace,
@@ -335,7 +360,10 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			By("cleaning up")
 			cmd = exec.Command("kubectl", "delete", "batchsandbox", sandboxName, "-n", pauseResumeNamespace, "--ignore-not-found=true")
 			utils.Run(cmd)
-		})
+		},
+			Entry("after pod deletion completes", true),
+			Entry("immediately while the old pod is terminating", false),
+		)
 
 		It("should complete pool-based pause-resume via spec.pause trigger", func() {
 			const poolName = "test-pool-pause"
@@ -942,15 +970,20 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 			Expect(err).NotTo(HaveOccurred())
 			imageDigest := strings.TrimSpace(digestOutput)
 			Expect(imageDigest).NotTo(BeEmpty())
-			statusPatch := fmt.Sprintf(
-				`{"status":{"containers":[{"containerName":"sandbox-container","imageUri":"invalid.registry/unreachable/image:nonexistent","imageDigest":%q}]}}`,
-				imageDigest,
-			)
-			cmd = exec.Command("kubectl", "patch", "sandboxsnapshot", sandboxName+"-pause",
-				"-n", pauseResumeNamespace, "--type=merge", "--subresource=status",
-				"-p", statusPatch)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
+			// `kubectl patch --subresource=status` requires kubectl v1.24+, so write
+			// the tampered status through the raw status subresource endpoint
+			// instead; that keeps the suite runnable against older kubectl (e.g.
+			// v1.22) with identical semantics: a JSON merge patch of
+			// status.containers replaces the whole array.
+			tamperedContainers := []interface{}{
+				map[string]interface{}{
+					"containerName": "sandbox-container",
+					"imageUri":      "invalid.registry/unreachable/image:nonexistent",
+					"imageDigest":   imageDigest,
+				},
+			}
+			Expect(patchSandboxSnapshotStatusContainers(
+				pauseResumeNamespace, sandboxName+"-pause", tamperedContainers)).To(Succeed())
 
 			By("triggering resume with tampered snapshot")
 			cmd = exec.Command("kubectl", "patch", "batchsandbox", sandboxName,
@@ -1008,6 +1041,58 @@ var _ = Describe("PauseResume", Ordered, Label("PauseResume"), func() {
 
 	})
 })
+
+// patchSandboxSnapshotStatusContainers replaces status.containers of the named
+// SandboxSnapshot through the raw status subresource endpoint. It is the
+// equivalent of `kubectl patch --type=merge --subresource=status` for kubectl
+// versions older than v1.24, where the --subresource flag does not exist: read
+// the current object, swap in the new containers array, and PUT it back with
+// `kubectl replace --raw`, which has been available since well before v1.22.
+// The read-modify-write round trip is retried so that a concurrent controller
+// status update (409 Conflict) between the GET and the PUT cannot flake the
+// caller.
+func patchSandboxSnapshotStatusContainers(namespace, name string, containers []interface{}) error {
+	rawPath := fmt.Sprintf("/apis/sandbox.opensandbox.io/v1alpha1/namespaces/%s/sandboxsnapshots/%s/status",
+		namespace, name)
+	bodyFile, err := os.CreateTemp("", "sandboxsnapshot-status-*.json")
+	if err != nil {
+		return fmt.Errorf("create temp file for the status body: %w", err)
+	}
+	defer os.Remove(bodyFile.Name())
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		current, err := utils.Run(exec.Command("kubectl", "get", "sandboxsnapshot", name,
+			"-n", namespace, "-o", "json"))
+		if err != nil {
+			return fmt.Errorf("get sandboxsnapshot %s: %w", name, err)
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal([]byte(current), &obj); err != nil {
+			return fmt.Errorf("parse sandboxsnapshot %s: %w", name, err)
+		}
+		status, ok := obj["status"].(map[string]interface{})
+		if !ok {
+			status = map[string]interface{}{}
+			obj["status"] = status
+		}
+		status["containers"] = containers
+		updated, err := json.Marshal(obj)
+		if err != nil {
+			return fmt.Errorf("serialize sandboxsnapshot %s: %w", name, err)
+		}
+		if err := os.WriteFile(bodyFile.Name(), updated, 0600); err != nil {
+			return fmt.Errorf("write the status body: %w", err)
+		}
+		if _, err := utils.Run(exec.Command("kubectl", "replace", "--raw", rawPath,
+			"-f", bodyFile.Name())); err != nil {
+			lastErr = fmt.Errorf("put the status of sandboxsnapshot %s: %w", name, err)
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
 
 // createHtpasswdSecret creates the htpasswd secret for registry authentication.
 // Docker Registry v2 only supports bcrypt hashes, not MD5 ($apr1$) or SHA1.

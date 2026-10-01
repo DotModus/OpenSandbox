@@ -38,8 +38,9 @@ Component versions needed for the features covered by this guide:
   recommended** for `binds`, `List sessions`, `uid_mode: "userns"`, and the
   default writable allowlist (`/workspace`, `/mnt`, `/media`, `/data`)
 - `opensandbox-server` >= 0.2.1 — the server injects `CAP_SYS_ADMIN`,
-  `apparmor=unconfined`, and the tmpfs mount required by `bwrap` when the
-  execd image declares `bootstrap.execd.isolation`
+  unconfined AppArmor, seccomp, and protected-system-path settings, and the
+  tmpfs mount required by `bwrap` when the execd image declares
+  `bootstrap.execd.isolation`
 - Python SDK >= 0.1.14 (`isolation.run_once` / `isolation.session` context
   manager); >= 0.1.13 for the generated isolation client only
 - JavaScript / TypeScript SDK >= 0.1.10 (`isolation.runOnce` /
@@ -298,9 +299,59 @@ Background run semantics:
 
 Overlay upper dirs live under `upper_root` (default `/var/lib/execd/isolation`).
 
+Because isolated-session state lives only in execd's memory, every upper dir
+left under `upper_root` when execd exits is orphaned. On startup execd
+reclaims leftover session directories under `upper_root` — session state never
+survives a restart, so nothing legitimate is lost. Only directories with the
+execd session layout (`<id>/upper`) are removed; if `upper_root` points at a
+directory shared with other data, unrelated children are never touched
+(`upper_root` should still be a dedicated directory). Residue that cannot be
+removed yet — e.g. an upper still referenced by a mount from the previous
+lifetime — stays counted toward `upper_max_bytes` and is retried by the idle
+collector. In pooled / pre-provisioned sandboxes this also prevents one
+occupant's session data from leaking to the next.
+
 ```json
 { "workspace": { "path": "/workspace", "mode": "overlay" } }
 ```
+
+---
+
+## Multiple Overlay Mounts
+
+A session can carry **several independent overlay mounts** via the `overlays`
+request field (the single `workspace` remains supported as sugar for a
+one-element list; when both are present, `workspace` is prepended):
+
+```json
+{
+  "overlays": [
+    { "path": "/", "mode": "overlay" },
+    { "path": "/workspace", "mode": "overlay", "persist": true },
+    { "path": "/data/scratch", "mode": "overlay", "persist": false }
+  ]
+}
+```
+
+- Each entry has its own mount semantics, so workspace files, system-level
+  changes (`apt install` → `/usr`, config → `/etc`), and additional project
+  directories get **independent copy-on-write uppers**.
+- Mounts are applied shallow-first; a nested overlay (e.g. `/workspace` on
+  top of a `/` root overlay) shadows its ancestors within its own subtree.
+  Paths must be absolute and unique.
+- `persist` (overlay mode only, default `true`): `true` allocates a host
+  upper directory under `upper_root`; `false` uses an ephemeral tmpfs upper
+  whose writes are discarded when the session ends. `rw`/`ro` entries must
+  not set `persist`. An ephemeral upper lives inside the namespace only, so
+  the files API serves `persist=false` overlays from their host-side
+  content: in-session writes under such an overlay are not observable
+  through the files API and files-API writes into it are rejected.
+- The files API routes each request to the overlay whose mount path is the
+  longest prefix of the requested path; relative paths resolve against the
+  first overlay.
+- Background runs use the **first** overlay for their log location: it must
+  be `rw`, or `overlay` with `persist: true`; otherwise background runs are
+  rejected.
 
 ---
 
@@ -451,8 +502,9 @@ Point execd at an optional TOML file:
 # Parent directory for per-session overlay upper dirs.
 upper_root = "/var/lib/execd/isolation"
 
-# Hard limit on total upper directory size across all sessions (bytes).
-# Default: 8 GiB. Set to 0 only if you want to disable the quota entirely.
+# Allocation-time threshold for total overlay upper-directory size (bytes).
+# Existing sessions can write beyond this value.
+# Default: 8 GiB. Set to 0 to disable the allocation check.
 upper_max_bytes = 8589934592  # 8 GiB
 
 # Sources allowed for extra_writable / binds (symlink-resolved).
@@ -461,6 +513,15 @@ allowed_writable = ["/workspace", "/mnt", "/media", "/data"]
 ```
 
 Example: `components/execd/configs/isolation.example.toml`.
+
+`upper_max_bytes` is checked when creating an `overlay` workspace (the default
+mode). If a successful usage scan reports a total at or above the configured
+positive limit, the new session is rejected. This setting does not cap writes
+by existing sessions and does not apply to `rw` or `ro` workspaces.
+
+Deleting an overlay session can restore admission once its cleanup succeeds
+and total usage falls below the threshold. Deletion discards that session's
+private upper data, so preserve any data you need before deleting it.
 
 **Host requirements:** `bwrap` and the trusted native workload gate in the
 execd image; `CAP_SYS_ADMIN` (and `kernel.unprivileged_userns_clone=1` for
@@ -481,8 +542,7 @@ still fail at runtime on such hosts. If you rely on `workspace.mode:
 
 ## Limitations
 
-- **`diff` / `commit` are Phase 2 stubs**, currently return `503`. Tracked
-  in [OSEP-0013](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0013-isolated-execution-api.md).
+- **`diff` / `commit` are Phase 2 stubs**, currently return `503`.
 - **No hardware-level guarantee.** Namespaces + seccomp only; pair with a
   secure runtime for kernel-exploit defense.
 - **Linux only.** Non-Linux builds return `available: false`.
@@ -493,7 +553,6 @@ still fail at runtime on such hosts. If you rely on `workspace.mode:
 
 ## See Also
 
-- [OSEP-0013 — Isolated Execution API](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0013-isolated-execution-api.md)
-- [execd](/components/execd)
+- [execd](/architecture/data-plane/execd)
 - [Secure Container Runtime](/guides/secure-container)
 - [execd OpenAPI spec](/api/)

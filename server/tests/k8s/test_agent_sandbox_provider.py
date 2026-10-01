@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,24 +20,32 @@ import pytest
 from fastapi import HTTPException
 from kubernetes.client import ApiException
 
-from opensandbox_server.api.schema import ImageSpec, NetworkPolicy, NetworkRule, PlatformSpec
+from opensandbox_server.api.schema import ImageAuth, ImageSpec, NetworkPolicy, NetworkRule, PlatformSpec
 from opensandbox_server.config import (
     AppConfig,
     AgentSandboxRuntimeConfig,
     EGRESS_MODE_DNS,
     EGRESS_MODE_DNS_NFT,
+    EgressUpstreamProxyConfig,
     ExecdInitResources,
     KubernetesRuntimeConfig,
     RuntimeConfig,
 )
 from opensandbox_server.services.constants import (
+    EGRESS_UPSTREAM_EXTRA_CA_PATH,
+    EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+    EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
     OPEN_SANDBOX_EGRESS_AUTH_HEADER,
     OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT,
+    OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA,
     OPENSANDBOX_RUNTIME_MOUNT_PATH,
     OPENSANDBOX_RUNTIME_VOLUME_NAME,
     SANDBOX_EGRESS_AUTH_TOKEN_METADATA_KEY,
 )
 from opensandbox_server.services.k8s.agent_sandbox_provider import AgentSandboxProvider
+from opensandbox_server.services.k8s.image_pull_secret_helper import (
+    IMAGE_AUTH_SECRET_PREFIX,
+)
 from opensandbox_server.services.k8s.workload_provider import EgressWorkloadSettings
 from opensandbox_server.services.constants import OPENSANDBOX_EGRESS_TOKEN
 
@@ -66,6 +74,7 @@ def _egress_settings(
     auth_token: str | None = None,
     credential_proxy_enabled: bool = False,
     disable_ipv6: bool = True,
+    upstream_proxy: EgressUpstreamProxyConfig | None = None,
 ) -> EgressWorkloadSettings:
     return EgressWorkloadSettings(
         network_policy=network_policy,
@@ -77,6 +86,7 @@ def _egress_settings(
         disable_ipv6=disable_ipv6,
         resource_requests=None,
         resource_limits=None,
+        upstream_proxy=upstream_proxy,
     )
 
 
@@ -85,7 +95,7 @@ class TestAgentSandboxProvider:
         provider = AgentSandboxProvider(mock_k8s_client)
 
         assert provider.group == "agents.x-k8s.io"
-        assert provider.version == "v1alpha1"
+        assert provider.version == "v1beta1"
         assert provider.plural == "sandboxes"
 
     def test_create_workload_builds_correct_manifest_init_mode(self, mock_k8s_client):
@@ -111,14 +121,20 @@ class TestAgentSandboxProvider:
             execd_image="execd:latest",
         )
 
-        assert result == {"name": "test-id", "uid": "test-uid", "apiVersion": "agents.x-k8s.io/v1alpha1", "kind": "Sandbox"}
+        assert result == {"name": "test-id", "uid": "test-uid", "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox"}
 
-        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
-        assert body["apiVersion"] == "agents.x-k8s.io/v1alpha1"
+        call_kwargs = mock_k8s_client.create_custom_object.call_args.kwargs
+        assert call_kwargs["group"] == "agents.x-k8s.io"
+        assert call_kwargs["version"] == "v1beta1"
+        assert call_kwargs["plural"] == "sandboxes"
+        body = call_kwargs["body"]
+        assert body["apiVersion"] == "agents.x-k8s.io/v1beta1"
         assert body["kind"] == "Sandbox"
         assert body["metadata"]["name"] == "test-id"
         assert body["metadata"]["namespace"] == "test-ns"
-        assert body["spec"]["replicas"] == 1
+        assert body["spec"]["operatingMode"] == "Running"
+        assert body["spec"]["service"] is True
+        assert "replicas" not in body["spec"]
         assert body["spec"]["shutdownTime"] == "2025-12-31T10:00:00+00:00"
         assert body["spec"]["shutdownPolicy"] == "Delete"
         assert body["spec"]["podTemplate"]["spec"]["automountServiceAccountToken"] is False
@@ -126,6 +142,45 @@ class TestAgentSandboxProvider:
         assert "initContainers" in body["spec"]["podTemplate"]["spec"]
         assert "containers" in body["spec"]["podTemplate"]["spec"]
         assert "volumes" in body["spec"]["podTemplate"]["spec"]
+
+    @pytest.mark.parametrize("expires_at", [None, datetime(2026, 12, 31, tzinfo=timezone.utc)])
+    def test_create_workload_overrides_template_lifecycle(self, mock_k8s_client, expires_at):
+        provider = AgentSandboxProvider(mock_k8s_client, _app_config(shutdown_policy="Retain"))
+        provider.template_manager._template = {
+            "spec": {
+                "operatingMode": "Suspended",
+                "service": False,
+                "shutdownPolicy": "Delete",
+                "shutdownTime": "2025-01-01T00:00:00Z",
+                "podTemplate": {"spec": {"nodeSelector": {"env": "test"}}},
+            }
+        }
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "test-uid"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11", auth=None),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={"cpu": "1", "memory": "1Gi"},
+            labels={},
+            expires_at=expires_at,
+            execd_image="execd:latest",
+        )
+
+        spec = mock_k8s_client.create_custom_object.call_args.kwargs["body"]["spec"]
+        assert spec["operatingMode"] == "Running"
+        assert spec["service"] is True
+        assert "replicas" not in spec
+        assert spec["shutdownPolicy"] == "Retain"
+        assert spec["podTemplate"]["spec"]["nodeSelector"] == {"env": "test"}
+        if expires_at is None:
+            assert "shutdownTime" not in spec
+        else:
+            assert spec["shutdownTime"] == expires_at.isoformat()
 
     def test_create_workload_injects_platform_node_selector(self, mock_k8s_client):
         provider = AgentSandboxProvider(mock_k8s_client, _app_config())
@@ -349,7 +404,7 @@ spec:
             execd_image="execd:latest",
         )
 
-        assert result == {"name": "sandbox-1234", "uid": "test-uid", "apiVersion": "agents.x-k8s.io/v1alpha1", "kind": "Sandbox"}
+        assert result == {"name": "sandbox-1234", "uid": "test-uid", "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox"}
         body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
         assert body["metadata"]["name"] == "sandbox-1234"
 
@@ -439,7 +494,7 @@ spec:
             execd_image="execd:latest",
         )
 
-        assert result == {"name": "test-id", "uid": "test-uid", "apiVersion": "agents.x-k8s.io/v1alpha1", "kind": "Sandbox"}
+        assert result == {"name": "test-id", "uid": "test-uid", "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox"}
 
     def test_update_expiration_patches_spec(self, mock_k8s_client):
         provider = AgentSandboxProvider(mock_k8s_client)
@@ -481,6 +536,189 @@ spec:
         assert result["state"] == "Running"
         assert result["reason"] == "SandboxReady"
         assert result["message"] == "Ready"
+
+    def test_get_status_suspended_condition_true_maps_to_paused(self):
+        provider = AgentSandboxProvider(MagicMock())
+        workload = {
+            "spec": {"operatingMode": "Suspended"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Suspended",
+                        "status": "True",
+                        "reason": "PodTerminated",
+                        "message": "Sandbox pod has been terminated",
+                        "lastTransitionTime": "2025-12-31T10:05:00Z",
+                    },
+                    {
+                        "type": "Ready",
+                        "status": "False",
+                        "reason": "NotReady",
+                        "message": "Sandbox is suspended",
+                        "lastTransitionTime": "2025-12-31T10:00:00Z",
+                    },
+                ]
+            },
+            "metadata": {"creationTimestamp": "2025-12-31T09:00:00Z"},
+        }
+
+        result = provider.get_status(workload)
+
+        assert result["state"] == "Paused"
+        assert result["reason"] == "PodTerminated"
+        assert result["message"] == "Sandbox pod has been terminated"
+        assert result["last_transition_at"] == "2025-12-31T10:05:00Z"
+
+    def test_get_status_suspended_true_with_running_mode_maps_to_resuming(self):
+        provider = AgentSandboxProvider(MagicMock())
+        workload = {
+            "spec": {"operatingMode": "Running"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Suspended",
+                        "status": "True",
+                        "reason": "PodTerminated",
+                        "message": "Sandbox pod has been terminated",
+                        "lastTransitionTime": "2025-12-31T10:05:00Z",
+                    }
+                ]
+            },
+            "metadata": {"creationTimestamp": "2025-12-31T09:00:00Z"},
+        }
+
+        result = provider.get_status(workload)
+
+        assert result["state"] == "Resuming"
+        assert result["message"] == "Sandbox is resuming"
+
+    def test_get_status_expired_outranks_suspended_condition(self):
+        provider = AgentSandboxProvider(MagicMock())
+        workload = {
+            "spec": {"operatingMode": "Suspended"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Suspended",
+                        "status": "True",
+                        "reason": "PodTerminated",
+                        "message": "Sandbox pod has been terminated",
+                        "lastTransitionTime": "2025-12-31T10:05:00Z",
+                    },
+                    {
+                        "type": "Ready",
+                        "status": "False",
+                        "reason": "SandboxExpired",
+                        "message": "Sandbox has expired",
+                        "lastTransitionTime": "2025-12-31T11:00:00Z",
+                    },
+                ]
+            },
+            "metadata": {"creationTimestamp": "2025-12-31T09:00:00Z"},
+        }
+
+        result = provider.get_status(workload)
+
+        assert result["state"] == "Terminated"
+        assert result["reason"] == "SandboxExpired"
+
+    def test_get_status_suspended_condition_takes_precedence_over_ready_true(self):
+        provider = AgentSandboxProvider(MagicMock())
+        workload = {
+            "spec": {"operatingMode": "Suspended"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "SandboxReady",
+                        "message": "Ready",
+                        "lastTransitionTime": "2025-12-31T10:00:00Z",
+                    },
+                    {
+                        "type": "Suspended",
+                        "status": "True",
+                        "reason": "PodTerminated",
+                        "message": "Sandbox pod has been terminated",
+                        "lastTransitionTime": "2025-12-31T10:05:00Z",
+                    },
+                ]
+            },
+            "metadata": {"creationTimestamp": "2025-12-31T09:00:00Z"},
+        }
+
+        result = provider.get_status(workload)
+
+        assert result["state"] == "Paused"
+
+    def test_get_status_operating_mode_suspended_condition_not_true_maps_to_pausing(self):
+        provider = AgentSandboxProvider(MagicMock())
+        workload = {
+            "spec": {"operatingMode": "Suspended"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Suspended",
+                        "status": "False",
+                        "reason": "PodTerminating",
+                        "message": "Sandbox pod is terminating",
+                        "lastTransitionTime": "2025-12-31T10:05:00Z",
+                    }
+                ]
+            },
+            "metadata": {"creationTimestamp": "2025-12-31T09:00:00Z"},
+        }
+
+        result = provider.get_status(workload)
+
+        assert result["state"] == "Pausing"
+        assert result["reason"] == "PodTerminating"
+        assert result["message"] == "Sandbox pod is terminating"
+        assert result["last_transition_at"] == "2025-12-31T10:05:00Z"
+
+    def test_get_status_operating_mode_suspended_without_condition_maps_to_pausing(self):
+        provider = AgentSandboxProvider(MagicMock())
+        workload = {
+            "spec": {"operatingMode": "Suspended"},
+            "status": {"conditions": []},
+            "metadata": {"creationTimestamp": "2025-12-31T09:00:00Z"},
+        }
+
+        result = provider.get_status(workload)
+
+        assert result["state"] == "Pausing"
+        assert result["reason"] is None
+        assert result["message"] == "Pausing sandbox"
+
+    def test_get_status_operating_mode_running_with_suspended_false_uses_ready_mapping(self):
+        provider = AgentSandboxProvider(MagicMock())
+        workload = {
+            "spec": {"operatingMode": "Running"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Suspended",
+                        "status": "False",
+                        "reason": "NotSuspended",
+                        "message": "",
+                        "lastTransitionTime": "2025-12-31T09:30:00Z",
+                    },
+                    {
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "SandboxReady",
+                        "message": "Ready",
+                        "lastTransitionTime": "2025-12-31T10:00:00Z",
+                    },
+                ]
+            },
+            "metadata": {"creationTimestamp": "2025-12-31T09:00:00Z"},
+        }
+
+        result = provider.get_status(workload)
+
+        assert result["state"] == "Running"
+        assert result["reason"] == "SandboxReady"
 
     def test_get_status_expired_condition(self):
         provider = AgentSandboxProvider(MagicMock())
@@ -802,6 +1040,382 @@ spec:
         assert endpoint.endpoint == "svc.example.com:9000"
         assert endpoint.headers is None
 
+    # ===== Pause / Resume Tests =====
+
+    def _running_sandbox(self) -> dict:
+        return {
+            "metadata": {"name": "test-id", "namespace": "test-ns"},
+            "spec": {"operatingMode": "Running"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "True",
+                        "reason": "SandboxReady",
+                        "message": "Ready",
+                        "lastTransitionTime": "2025-12-31T10:00:00Z",
+                    }
+                ]
+            },
+        }
+
+    def _paused_sandbox(self) -> dict:
+        return {
+            "metadata": {"name": "test-id", "namespace": "test-ns"},
+            "spec": {"operatingMode": "Suspended"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Suspended",
+                        "status": "True",
+                        "reason": "PodTerminated",
+                        "message": "Sandbox pod has been terminated",
+                        "lastTransitionTime": "2025-12-31T10:05:00Z",
+                    }
+                ]
+            },
+        }
+
+    def _pausing_sandbox(self) -> dict:
+        return {
+            "metadata": {"name": "test-id", "namespace": "test-ns"},
+            "spec": {"operatingMode": "Suspended"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Suspended",
+                        "status": "False",
+                        "reason": "PodTerminating",
+                        "message": "Sandbox pod is terminating",
+                        "lastTransitionTime": "2025-12-31T10:05:00Z",
+                    }
+                ]
+            },
+        }
+
+    def _pending_sandbox(self) -> dict:
+        return {
+            "metadata": {"name": "test-id", "namespace": "test-ns"},
+            "spec": {"operatingMode": "Running"},
+            "status": {"conditions": []},
+        }
+
+    def test_pause_sandbox_running_allows(self, mock_k8s_client):
+        """Pause allowed when Ready=True; patches spec.operatingMode=Suspended."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = self._running_sandbox()
+        mock_k8s_client.patch_custom_object.return_value = {}
+
+        provider.pause_sandbox("test-id", "test-ns")
+
+        mock_k8s_client.patch_custom_object.assert_called_once()
+        call_kwargs = mock_k8s_client.patch_custom_object.call_args.kwargs
+        assert call_kwargs["group"] == "agents.x-k8s.io"
+        assert call_kwargs["version"] == "v1beta1"
+        assert call_kwargs["plural"] == "sandboxes"
+        assert call_kwargs["name"] == "test-id"
+        assert call_kwargs["body"] == {"spec": {"operatingMode": "Suspended"}}
+
+    def test_pause_sandbox_already_paused_rejects(self, mock_k8s_client):
+        """Pause rejected when the sandbox is already paused."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = self._paused_sandbox()
+
+        with pytest.raises(ValueError, match="already paused"):
+            provider.pause_sandbox("test-id", "test-ns")
+
+        mock_k8s_client.patch_custom_object.assert_not_called()
+
+    def test_pause_sandbox_pausing_rejects(self, mock_k8s_client):
+        """Pause rejected while the suspend operation is in progress."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = self._pausing_sandbox()
+
+        with pytest.raises(ValueError, match="operation in progress"):
+            provider.pause_sandbox("test-id", "test-ns")
+
+        mock_k8s_client.patch_custom_object.assert_not_called()
+
+    def test_pause_sandbox_pending_rejects(self, mock_k8s_client):
+        """Pause rejected with the public state name when not Running."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = self._pending_sandbox()
+
+        with pytest.raises(ValueError) as exc_info:
+            provider.pause_sandbox("test-id", "test-ns")
+
+        assert str(exc_info.value) == "Cannot pause sandbox in state Pending, expected Running"
+        mock_k8s_client.patch_custom_object.assert_not_called()
+
+    def test_pause_sandbox_terminated_rejects(self, mock_k8s_client):
+        """Pause rejected with the public state name when Terminated."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = {
+            "metadata": {"name": "test-id", "namespace": "test-ns"},
+            "spec": {"operatingMode": "Running"},
+            "status": {
+                "conditions": [
+                    {
+                        "type": "Ready",
+                        "status": "False",
+                        "reason": "SandboxExpired",
+                        "message": "Expired",
+                        "lastTransitionTime": "2025-12-31T10:00:00Z",
+                    }
+                ]
+            },
+        }
+
+        with pytest.raises(ValueError, match="state Terminated"):
+            provider.pause_sandbox("test-id", "test-ns")
+
+    def test_pause_sandbox_not_found(self, mock_k8s_client):
+        """Pause raises ValueError with 'not found' so the service maps it to 404."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            provider.pause_sandbox("test-id", "test-ns")
+
+    def test_pause_patch_after_delete_maps_to_not_found(self, mock_k8s_client):
+        """Patch 404 (CR deleted since the read) maps to the public not-found error."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = self._running_sandbox()
+        mock_k8s_client.patch_custom_object.side_effect = ApiException(status=404)
+
+        with pytest.raises(ValueError, match="not found"):
+            provider.pause_sandbox("test-id", "test-ns")
+
+    def test_resume_sandbox_paused_allows(self, mock_k8s_client):
+        """Resume allowed when the sandbox is paused; patches spec.operatingMode=Running."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = self._paused_sandbox()
+        mock_k8s_client.patch_custom_object.return_value = {}
+
+        provider.resume_sandbox("test-id", "test-ns")
+
+        mock_k8s_client.patch_custom_object.assert_called_once()
+        call_kwargs = mock_k8s_client.patch_custom_object.call_args.kwargs
+        assert call_kwargs["group"] == "agents.x-k8s.io"
+        assert call_kwargs["version"] == "v1beta1"
+        assert call_kwargs["plural"] == "sandboxes"
+        assert call_kwargs["name"] == "test-id"
+        assert call_kwargs["body"] == {"spec": {"operatingMode": "Running"}}
+
+    def test_resume_sandbox_running_rejects(self, mock_k8s_client):
+        """Resume rejected when the sandbox is running."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = self._running_sandbox()
+
+        with pytest.raises(ValueError) as exc_info:
+            provider.resume_sandbox("test-id", "test-ns")
+
+        assert str(exc_info.value) == "Cannot resume sandbox in state Running, expected Paused"
+        mock_k8s_client.patch_custom_object.assert_not_called()
+
+    def test_resume_sandbox_pausing_rejects(self, mock_k8s_client):
+        """Resume rejected while the suspend operation is in progress."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = self._pausing_sandbox()
+
+        with pytest.raises(ValueError, match="operation in progress"):
+            provider.resume_sandbox("test-id", "test-ns")
+
+    def test_resume_sandbox_pending_rejects(self, mock_k8s_client):
+        """Resume rejected with the public state name when not Paused."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = self._pending_sandbox()
+
+        with pytest.raises(ValueError, match="state Pending"):
+            provider.resume_sandbox("test-id", "test-ns")
+
+    def test_resume_sandbox_not_found(self, mock_k8s_client):
+        """Resume raises ValueError with 'not found' so the service maps it to 404."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = None
+
+        with pytest.raises(ValueError, match="not found"):
+            provider.resume_sandbox("test-id", "test-ns")
+
+    def test_resume_patch_after_delete_maps_to_not_found(self, mock_k8s_client):
+        """Patch 404 (CR deleted since the read) maps to the public not-found error."""
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.get_custom_object.return_value = self._paused_sandbox()
+        mock_k8s_client.patch_custom_object.side_effect = ApiException(status=404)
+
+        with pytest.raises(ValueError, match="not found"):
+            provider.resume_sandbox("test-id", "test-ns")
+
+
+    # ===== Image Auth / Pull Secrets Tests =====
+
+    def test_supports_image_auth_returns_true(self, mock_k8s_client):
+        provider = AgentSandboxProvider(mock_k8s_client, _app_config())
+        assert provider.supports_image_auth() is True
+
+    def test_create_workload_with_image_auth_injects_image_pull_secrets(
+        self, mock_k8s_client
+    ):
+        provider = AgentSandboxProvider(mock_k8s_client, _app_config())
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "uid-123"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(
+                uri="registry.example.com/img:tag",
+                auth=ImageAuth(username="user", password="pass"),
+            ),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            execd_image="execd:latest",
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pull_secrets = body["spec"]["podTemplate"]["spec"].get("imagePullSecrets")
+        assert pull_secrets == [{"name": f"{IMAGE_AUTH_SECRET_PREFIX}-test-id"}]
+
+    def test_create_workload_with_image_auth_preserves_template_pull_secrets(
+        self, mock_k8s_client, tmp_path
+    ):
+        # The template merge replaces lists wholesale, so the per-request
+        # secret must be appended to the merged spec, not assigned to the
+        # pre-merge pod spec — otherwise template-provided imagePullSecrets
+        # (e.g. for pulling a private execd image) are dropped.
+        template_file = tmp_path / "agent_template.yaml"
+        template_file.write_text(
+            """
+spec:
+  podTemplate:
+    spec:
+      imagePullSecrets:
+        - name: template-regcred
+"""
+        )
+        app_config = _app_config()
+        app_config.agent_sandbox.template_file = str(template_file)
+        provider = AgentSandboxProvider(mock_k8s_client, app_config)
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "uid-123"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(
+                uri="registry.example.com/img:tag",
+                auth=ImageAuth(username="user", password="pass"),
+            ),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            execd_image="execd:latest",
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pull_secrets = body["spec"]["podTemplate"]["spec"]["imagePullSecrets"]
+        assert pull_secrets == [
+            {"name": "template-regcred"},
+            {"name": f"{IMAGE_AUTH_SECRET_PREFIX}-test-id"},
+        ]
+
+    def test_create_workload_with_image_auth_creates_secret(self, mock_k8s_client):
+        # CR name gets a "sandbox-" prefix for digit-leading ids; the Secret's
+        # ownerReference must carry the CR name (not sandbox_id) or K8s GC
+        # deletes the Secret while the sandbox is still running.
+        provider = AgentSandboxProvider(mock_k8s_client, _app_config())
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "sandbox-test-id", "uid": "uid-abc"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(
+                uri="registry.example.com/img:tag",
+                auth=ImageAuth(username="user", password="pass"),
+            ),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            execd_image="execd:latest",
+        )
+
+        mock_k8s_client.create_secret.assert_called_once()
+        call_kwargs = mock_k8s_client.create_secret.call_args.kwargs
+        assert call_kwargs["namespace"] == "test-ns"
+        secret = call_kwargs["body"]
+        assert secret.type == "kubernetes.io/dockerconfigjson"
+        assert secret.metadata.name == f"{IMAGE_AUTH_SECRET_PREFIX}-test-id"
+        ref = secret.metadata.owner_references[0]
+        assert ref.uid == "uid-abc"
+        assert ref.kind == "Sandbox"
+        assert ref.name == "sandbox-test-id"
+
+    def test_create_workload_without_image_auth_skips_secret(self, mock_k8s_client):
+        provider = AgentSandboxProvider(mock_k8s_client, _app_config())
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "uid-123"}
+        }
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+            execd_image="execd:latest",
+        )
+
+        mock_k8s_client.create_secret.assert_not_called()
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        assert "imagePullSecrets" not in body["spec"]["podTemplate"]["spec"]
+
+    def test_create_workload_with_image_auth_secret_failure_rolls_back_sandbox(
+        self, mock_k8s_client
+    ):
+        provider = AgentSandboxProvider(mock_k8s_client, _app_config())
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "uid-123"}
+        }
+        mock_k8s_client.create_secret.side_effect = ApiException(status=403)
+
+        with pytest.raises(ApiException):
+            provider.create_workload(
+                sandbox_id="test-id",
+                namespace="test-ns",
+                image_spec=ImageSpec(
+                    uri="registry.example.com/img:tag",
+                    auth=ImageAuth(username="user", password="pass"),
+                ),
+                entrypoint=["/bin/bash"],
+                env={},
+                resource_limits={},
+                labels={},
+                expires_at=datetime(2025, 12, 31, tzinfo=timezone.utc),
+                execd_image="execd:latest",
+            )
+
+        mock_k8s_client.delete_custom_object.assert_called_once_with(
+            group=provider.group,
+            version=provider.version,
+            namespace="test-ns",
+            plural=provider.plural,
+            name="test-id",
+            grace_period_seconds=0,
+        )
 
 class TestAgentSandboxProviderExecdInit:
     """AgentSandboxProvider execd init container resource tests"""
@@ -893,7 +1507,6 @@ class TestAgentSandboxProviderEgress:
         pod_spec = body["spec"]["podTemplate"]["spec"]
         containers = pod_spec["containers"]
 
-        # Should only have main container
         assert len(containers) == 1
         assert containers[0]["name"] == "sandbox"
         # Should not have securityContext with sysctls
@@ -933,15 +1546,12 @@ class TestAgentSandboxProviderEgress:
         pod_spec = body["spec"]["podTemplate"]["spec"]
         containers = pod_spec["containers"]
 
-        # Should have both main container and sidecar
         assert len(containers) == 2
 
-        # Find sidecar container
         sidecar = next((c for c in containers if c["name"] == "egress"), None)
         assert sidecar is not None
         assert sidecar["image"] == "opensandbox/egress:v1.1.7"
 
-        # Verify sidecar has environment variable
         env_vars = {e["name"]: e["value"] for e in sidecar.get("env", [])}
         assert "OPENSANDBOX_EGRESS_RULES" in env_vars
         assert env_vars["OPENSANDBOX_EGRESS_MODE"] == EGRESS_MODE_DNS
@@ -1155,11 +1765,9 @@ class TestAgentSandboxProviderEgress:
         pod_spec = body["spec"]["podTemplate"]["spec"]
         containers = pod_spec["containers"]
 
-        # Find main container
         main_container = next((c for c in containers if c["name"] == "sandbox"), None)
         assert main_container is not None
 
-        # Verify main container has securityContext
         assert "securityContext" in main_container
         assert "capabilities" in main_container["securityContext"]
         assert "drop" in main_container["securityContext"]["capabilities"]
@@ -1203,7 +1811,6 @@ class TestAgentSandboxProviderEgress:
         env_vars = {e["name"]: e["value"] for e in sidecar.get("env", [])}
         assert "OPENSANDBOX_EGRESS_RULES" in env_vars
 
-        # Verify the environment variable contains valid JSON with network policy
         import json
 
         policy_json = json.loads(env_vars["OPENSANDBOX_EGRESS_RULES"])
@@ -1211,6 +1818,78 @@ class TestAgentSandboxProviderEgress:
         assert len(policy_json["egress"]) == 2
         assert policy_json["egress"][0]["action"] == "allow"
         assert policy_json["egress"][0]["target"] == "pypi.org"
+
+    def test_create_workload_mounts_upstream_proxy_ca_secret_only_on_egress(
+        self, mock_k8s_client
+    ):
+        provider = AgentSandboxProvider(mock_k8s_client)
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "test-uid"}
+        }
+        network_policy = NetworkPolicy(
+            default_action="deny",
+            egress=[NetworkRule(action="allow", target="pypi.org")],
+        )
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=datetime(2025, 12, 31, 10, 0, 0, tzinfo=timezone.utc),
+            execd_image="execd:latest",
+            egress_settings=_egress_settings(
+                network_policy,
+                credential_proxy_enabled=True,
+                upstream_proxy=EgressUpstreamProxyConfig(
+                    url="https://proxy.local:8443",
+                    ca_secret_name="corp-proxy-ca",
+                ),
+            ),
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["podTemplate"]["spec"]
+        containers = pod_spec["containers"]
+
+        ca_volume = {
+            "name": EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+            "secret": {
+                "secretName": "corp-proxy-ca",
+                "items": [
+                    {
+                        "key": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                        "path": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+                    }
+                ],
+            },
+        }
+        assert ca_volume in pod_spec["volumes"]
+
+        sidecar = next(c for c in containers if c["name"] == "egress")
+        assert {
+            "name": EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME,
+            "mountPath": EGRESS_UPSTREAM_EXTRA_CA_PATH,
+            "subPath": EGRESS_UPSTREAM_EXTRA_CA_SECRET_KEY,
+            "readOnly": True,
+        } in sidecar["volumeMounts"]
+        env_vars = {e["name"]: e["value"] for e in sidecar["env"]}
+        assert (
+            env_vars[OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA]
+            == EGRESS_UPSTREAM_EXTRA_CA_PATH
+        )
+
+        main = next(c for c in containers if c["name"] == "sandbox")
+        assert EGRESS_UPSTREAM_EXTRA_CA_VOLUME_NAME not in {
+            m["name"] for m in main.get("volumeMounts", [])
+        }
+        assert (
+            OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA
+            not in {e["name"] for e in main.get("env", [])}
+        )
 
     def test_main_container_no_security_context_without_network_policy(self, mock_k8s_client):
         provider = AgentSandboxProvider(mock_k8s_client)
@@ -1237,5 +1916,4 @@ class TestAgentSandboxProviderEgress:
         containers = pod_spec["containers"]
 
         main_container = containers[0]
-        # Main container should not have securityContext when no network policy
         assert "securityContext" not in main_container

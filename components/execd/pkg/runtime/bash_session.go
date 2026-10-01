@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/alibaba/opensandbox/internal/safego"
 	"github.com/google/uuid"
 
 	"github.com/alibaba/opensandbox/execd/pkg/isolation"
@@ -55,7 +56,8 @@ const (
 )
 
 func (c *Controller) createBashSession(req *CreateContextRequest) (string, error) {
-	resolvedCwd, err := pathutil.ExpandPath(req.Cwd)
+	env := newBashSessionEnv()
+	resolvedCwd, err := pathutil.ExpandPathWithEnv(req.Cwd, env)
 	if err != nil {
 		return "", fmt.Errorf("resolve request cwd %s: %w", req.Cwd, err)
 	}
@@ -66,13 +68,13 @@ func (c *Controller) createBashSession(req *CreateContextRequest) (string, error
 		}
 	}
 
-	session := newBashSession(resolvedCwd)
+	session := newBashSession(resolvedCwd, env)
 	if err := session.start(); err != nil {
 		return "", fmt.Errorf("failed to start bash session: %w", err)
 	}
 
 	c.bashSessionClientMap.Store(session.config.Session, session)
-	log.Info("created bash session %s", session.config.Session)
+	log.Info("bash session: created %s", session.config.Session)
 	return session.config.Session, nil
 }
 
@@ -117,16 +119,45 @@ func (c *Controller) RunInBashSession(ctx context.Context, req *ExecuteCodeReque
 	return c.runBashSession(ctx, req)
 }
 
+// ValidateBashSessionCwd validates a run's cwd against the target session's
+// environment (daemon env, EXECD_ENVS file values, and variables exported in
+// earlier runs of the session), so requests referencing session-scoped
+// variables pass web-layer validation instead of failing at expansion time.
+// Returns ErrContextNotFound when the session does not exist.
+func (c *Controller) ValidateBashSessionCwd(sessionID, cwd string) error {
+	session := c.getBashSession(sessionID)
+	if session == nil {
+		return ErrContextNotFound
+	}
+	session.mu.Lock()
+	envSnapshot := copyEnvMap(session.env)
+	session.mu.Unlock()
+	return ValidateWorkingDirWithEnv(cwd, envSnapshot)
+}
+
 func (c *Controller) DeleteBashSession(sessionID string) error {
 	return c.closeBashSession(sessionID)
 }
 
-func newBashSession(cwd string) *bashSession {
+func newBashSession(cwd string, env map[string]string) *bashSession {
 	config := &bashSessionConfig{
 		Session:        uuidString(),
 		StartupTimeout: 5 * time.Second,
 	}
 
+	return &bashSession{
+		config: config,
+		env:    env,
+		cwd:    cwd,
+	}
+}
+
+// newBashSessionEnv builds the initial environment for a new bash session:
+// execd's process environment minus its own config/credential vars, overlaid
+// with the standard user env (sandbox binding envs from /init < EXECD_ENVS
+// file values — the same source the command path applies, with the same
+// precedence over the daemon environment).
+func newBashSessionEnv() map[string]string {
 	// The session env snapshot is exported into the wrapped script at the
 	// top, after the launcher has stripped the process environment — so it
 	// must not carry execd's own config/credential vars or a session user
@@ -139,11 +170,18 @@ func newBashSession(cwd string) *bashSession {
 		}
 	}
 
-	return &bashSession{
-		config: config,
-		env:    env,
-		cwd:    cwd,
+	// Sandbox binding vars and EXECD_ENVS file vars are user-code
+	// environment, not execd config. Blacklisted names stay excluded even if
+	// a layer redefines them, so the snapshot cannot be used to smuggle
+	// execd credentials back in.
+	for k, v := range UserEnvOverlay() {
+		if containsStr(blacklist, k) {
+			continue
+		}
+		env[k] = v
 	}
+
+	return env
 }
 
 func (s *bashSession) start() error {
@@ -181,9 +219,8 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 	envSnapshot := copyEnvMap(s.env)
 
 	cwd := s.cwd
-	// override original cwd if specified
 	if request.Cwd != "" {
-		expandedCwd, err := pathutil.ExpandPath(request.Cwd)
+		expandedCwd, err := pathutil.ExpandPathWithEnv(request.Cwd, envSnapshot)
 		if err != nil {
 			s.mu.Unlock()
 			return fmt.Errorf("resolve cwd: %w", err)
@@ -200,7 +237,7 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 
 	wait := request.Timeout
 	if wait <= 0 {
-		wait = 24 * 3600 * time.Second // max to 24 hours
+		wait = 24 * 3600 * time.Second
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, wait)
@@ -212,6 +249,8 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 		return fmt.Errorf("create script file: %w", err)
 	}
 	scriptPath := scriptFile.Name()
+	// The script embeds the session environment; do not leave it behind.
+	defer os.Remove(scriptPath)
 	if _, err := scriptFile.WriteString(script); err != nil {
 		_ = scriptFile.Close()
 		return fmt.Errorf("write script file: %w", err)
@@ -237,7 +276,7 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 	if err != nil {
 		_ = stdoutR.Close()
 		_ = stdoutW.Close()
-		log.Error("start %s session failed: %v (command: %q)", shell, err, log.SanitizeCommand(request.Code))
+		log.Error("bash session: start %s: %v (command: %q)", shell, err, log.SanitizeCommand(request.Code))
 		return fmt.Errorf("start %s: %w", shell, err)
 	}
 	// The child holds its own copy of the write end; closing ours lets the
@@ -247,6 +286,9 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 	defer stdoutR.Close()
 	defer s.untrackCurrentProcess()
 	s.trackCurrentProcess(cmd.Process.Pid)
+
+	stopGroupKill := killProcessGroupOnDone(ctx, cmd.Process.Pid)
+	defer stopGroupKill()
 
 	scanner := bufio.NewScanner(stdoutR)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
@@ -286,12 +328,12 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 	waitErr := mp.Wait()
 
 	if scanErr != nil {
-		log.Error("read stdout failed: %v (command: %q)", scanErr, log.SanitizeCommand(request.Code))
+		log.Error("bash session: read stdout: %v (command: %q)", scanErr, log.SanitizeCommand(request.Code))
 		return fmt.Errorf("read stdout: %w", scanErr)
 	}
 
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		log.Error("timeout after %s while running command: %q", wait, log.SanitizeCommand(request.Code))
+		log.Error("bash session: timeout after %s (command: %q)", wait, log.SanitizeCommand(request.Code))
 		return fmt.Errorf("timeout after %s", wait)
 	}
 
@@ -312,7 +354,7 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 
 	var exitCodeErr exitCoder
 	if waitErr != nil && !errors.As(waitErr, &exitCodeErr) {
-		log.Error("command wait failed: %v (command: %q)", waitErr, log.SanitizeCommand(request.Code))
+		log.Error("bash session: wait: %v (command: %q)", waitErr, log.SanitizeCommand(request.Code))
 		return waitErr
 	}
 
@@ -333,7 +375,7 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 				Traceback: []string{errMsg},
 			})
 		}
-		log.Error("CommandExecError: %s (command: %q)", errMsg, log.SanitizeCommand(request.Code))
+		log.Error("bash session: command error: %s (command: %q)", errMsg, log.SanitizeCommand(request.Code))
 		return nil
 	}
 
@@ -342,6 +384,28 @@ func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) erro
 	}
 
 	return nil
+}
+
+// killProcessGroupOnDone kills pid's process group, as close() does, if ctx is
+// done before stop is called. exec.CommandContext only kills the leader, and
+// children holding the output pipe would keep the run blocked until they exit.
+func killProcessGroupOnDone(ctx context.Context, pid int) (stop func()) {
+	done := make(chan struct{})
+	safego.Go(func() {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			// Re-check done: the run may be returning concurrently, after
+			// which -pid may name a recycled process group.
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		}
+	})
+	return func() { close(done) }
 }
 
 func buildWrappedScript(command string, env map[string]string, cwd string) string {
@@ -565,7 +629,7 @@ func (s *bashSession) close() error {
 
 	if pid != 0 {
 		if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil {
-			log.Warn("kill session process group %d: %v (process may have already exited)", pid, err)
+			log.Warn("bash session: kill process group %d: %v (process may have already exited)", pid, err)
 		}
 	}
 	return nil

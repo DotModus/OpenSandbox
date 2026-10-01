@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,7 +28,6 @@ const (
 	ProfileBalanced Profile = "balanced"
 )
 
-// Valid reports whether p is a known profile name.
 func (p Profile) Valid() bool {
 	return p == ProfileStrict || p == ProfileBalanced
 }
@@ -43,7 +42,6 @@ const (
 	WorkspaceRO      WorkspaceMode = "ro"
 )
 
-// Valid reports whether m is a known workspace mode.
 func (m WorkspaceMode) Valid() bool {
 	return m == WorkspaceRW || m == WorkspaceOverlay || m == WorkspaceRO
 }
@@ -57,7 +55,6 @@ const (
 	EnvModeAllow EnvMode = "allow"
 )
 
-// Valid reports whether m is a known env passthrough mode.
 func (m EnvMode) Valid() bool {
 	return m == EnvModeDeny || m == EnvModeAllow
 }
@@ -78,17 +75,29 @@ const (
 	UidModeUserns UidMode = "userns"
 )
 
-// Valid reports whether m is a known uid mode.
 func (m UidMode) Valid() bool {
 	return m == UidModeSetpriv || m == UidModeUserns
 }
 
-// Structs
-
-// WorkspaceSpec describes a workspace directory and how it is mounted.
-type WorkspaceSpec struct {
+// OverlaySpec describes one mount destination inside the isolated namespace.
+// A WrapOptions carries one or more overlays; bubblewrap processes mounts in
+// argv order and a later mount shadows earlier ones in its subtree, so a
+// nested overlay (e.g. /workspace on top of a / root overlay) takes effect
+// at its own path.
+type OverlaySpec struct {
+	// Path is the mount destination inside the namespace. Required and
+	// absolute; duplicates across overlays are rejected.
 	Path string
+	// Mode controls how the path is mounted: rw (direct bind), ro
+	// (read-only bind), or overlay (copy-on-write).
 	Mode WorkspaceMode
+	// UpperDir is the host upper directory for overlay mode. Empty means an
+	// ephemeral tmpfs upper (the API-level persist=false). Ignored for
+	// rw/ro modes.
+	UpperDir string
+	// WorkDir is the host work directory for overlay mode. Empty defaults to
+	// UpperDir + "-work". Must be empty when UpperDir is empty.
+	WorkDir string
 }
 
 // EnvSpec controls environment variable passthrough into the namespace.
@@ -133,18 +142,14 @@ type Capabilities struct {
 // WrapOptions configures a single isolated execution.
 type WrapOptions struct {
 	Profile        Profile
-	Workspace      WorkspaceSpec
+	Overlays       []OverlaySpec
 	ExtraWritable  []string
 	Binds          []BindMount
 	ShareNet       bool
 	EnvPassthrough EnvSpec
 	Uid, Gid       *uint32
 	UidMode        UidMode // "" or "setpriv" → setpriv; "userns" → user namespace
-	UpperDir       string  // empty when upper is on tmpfs (persist disabled)
-	WorkDir        string
 }
-
-// Interface
 
 // Isolator wraps an *exec.Cmd in a namespace-isolated execution environment.
 type Isolator interface {

@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -536,3 +536,136 @@ class TestWorkloadInformerStartStop:
 
         assert watch_timeouts == [2, 2, 1, 2]
         assert list_counts == [1, 1, 1, 2]
+
+
+class TestWorkloadInformerEventHandlers:
+    """Late-attached reactor handlers (add_event_handler)."""
+
+    def test_late_handler_receives_resync_events(self):
+        """A handler attached after construction gets SYNC events from a resync."""
+        list_fn = MagicMock(return_value=_list_response("snap-1"))
+        informer = _make_informer(list_fn=list_fn)
+
+        events = []
+        informer.add_event_handler(lambda event_type, obj: events.append((event_type, obj)))
+        informer._full_resync()
+
+        assert [event_type for event_type, _ in events] == ["SYNC"]
+        assert events[0][1]["metadata"]["name"] == "snap-1"
+
+    def test_constructor_and_late_handlers_both_fire(self):
+        """Constructor-supplied and late-attached handlers both receive events."""
+        primary = []
+        late = []
+        informer = WorkloadInformer(
+            list_fn=MagicMock(return_value=_list_response("snap-1")),
+            enable_watch=False,
+            event_handler=lambda event_type, obj: primary.append(event_type),
+        )
+        informer.add_event_handler(lambda event_type, obj: late.append(event_type))
+
+        informer._dispatch_event("MODIFIED", {"metadata": {"name": "snap-1"}})
+
+        assert primary == ["MODIFIED"]
+        assert late == ["MODIFIED"]
+
+    def test_add_event_handler_ignores_none(self):
+        """Adding None is a no-op."""
+        informer = _make_informer()
+        informer.add_event_handler(None)
+        assert informer._event_handlers == []
+
+    def test_add_event_handler_is_idempotent(self):
+        """The same handler instance is registered only once."""
+        informer = _make_informer()
+        handler = lambda event_type, obj: None  # noqa: E731
+        informer.add_event_handler(handler)
+        informer.add_event_handler(handler)
+        assert informer._event_handlers == [handler]
+
+    def test_handler_failure_does_not_block_other_handlers(self):
+        """A raising handler never prevents later handlers from firing."""
+        informer = _make_informer()
+
+        seen = []
+        def bad(event_type, obj):
+            raise RuntimeError("boom")
+
+        informer.add_event_handler(bad)
+        informer.add_event_handler(lambda event_type, obj: seen.append(event_type))
+        informer._dispatch_event("ADDED", {"metadata": {"name": "snap-1"}})
+
+        assert seen == ["ADDED"]
+
+
+@pytest.mark.parametrize("event_type", ["ADDED", "MODIFIED", "DELETED", "SYNC"])
+def test_named_subscriptions_are_isolated_and_removable(event_type):
+    informer = _make_informer(list_fn=MagicMock(return_value=_list_response("alpha")))
+    alpha, beta, second_alpha = MagicMock(), MagicMock(), MagicMock()
+    unsubscribe = informer.subscribe(["alpha", "alpha"], alpha)
+    remove_second = informer.subscribe(["alpha"], second_alpha)
+    remove_beta = informer.subscribe(["beta"], beta)
+
+    def dispatch():
+        if event_type == "SYNC":
+            informer._full_resync()
+        else:
+            informer._handle_event({
+                "type": event_type,
+                "object": {"metadata": {"name": "alpha", "resourceVersion": "2"}},
+            })
+
+    dispatch()
+    assert alpha.call_count == 1
+    assert second_alpha.call_count == 1
+    assert alpha.call_args.args[0] == event_type
+    assert alpha.call_args.args[1]["metadata"]["name"] == "alpha"
+    beta.assert_not_called()
+    unsubscribe()
+    unsubscribe()
+    dispatch()
+    assert alpha.call_count == 1
+    assert second_alpha.call_count == 2
+    remove_second()
+    remove_beta()
+    assert informer._subscribers == {}
+
+
+def test_subscriber_can_read_updated_cache_and_unregister():
+    informer = _make_informer(list_fn=MagicMock(return_value=_list_response("alpha")))
+    informer._full_resync()
+    observed = []
+
+    def callback(event_type, obj):
+        observed.append(informer.get_if_synced("alpha"))
+        unsubscribe()
+
+    unsubscribe = informer.subscribe(["alpha"], callback)
+    obj = {"metadata": {"name": "alpha", "resourceVersion": "2"}}
+    informer._handle_event({"type": "MODIFIED", "object": obj})
+    assert observed == [obj]
+    assert informer._subscribers == {}
+
+
+def test_subscriber_failure_does_not_block_other_waiters():
+    informer = _make_informer()
+    informer.subscribe(["alpha"], MagicMock(side_effect=RuntimeError("closed loop")))
+    callback = MagicMock()
+    informer.subscribe(["alpha"], callback)
+    informer._handle_event({
+        "type": "MODIFIED",
+        "object": {"metadata": {"name": "alpha", "resourceVersion": "2"}},
+    })
+    callback.assert_called_once_with("MODIFIED", {"metadata": {"name": "alpha", "resourceVersion": "2"}})
+
+
+def test_subscriber_receives_object_while_cache_is_invalid():
+    informer = _make_informer(list_fn=MagicMock(return_value=_list_response("alpha")))
+    informer._full_resync()
+    informer.invalidate()
+    callback = MagicMock()
+    informer.subscribe(["alpha"], callback)
+    obj = {"metadata": {"name": "alpha", "uid": "uid-1", "resourceVersion": "2"}}
+    informer._handle_event({"type": "MODIFIED", "object": obj})
+    callback.assert_called_once_with("MODIFIED", obj)
+    assert informer.get_if_synced("alpha") is None

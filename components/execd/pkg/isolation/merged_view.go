@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -57,12 +57,10 @@ func NewMergedView(lower, upper string, mode WorkspaceMode, uid, gid uint32) *Me
 	}
 }
 
-// resolveUpper returns the upper path for a relative path.
 func (m *MergedView) resolveUpper(rel string) string {
 	return filepath.Join(m.UpperDir, rel)
 }
 
-// resolveLower returns the lower path for a relative path.
 func (m *MergedView) resolveLower(rel string) string {
 	return filepath.Join(m.LowerDir, rel)
 }

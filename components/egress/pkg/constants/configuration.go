@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,9 +20,12 @@ import (
 	"strings"
 )
 
-const EnvCredentialVaultTrustedProxyCIDRs = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_TRUSTED_PROXY_CIDRS"
+const (
+	EnvCredentialVaultTrustedProxyCIDRs  = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_TRUSTED_PROXY_CIDRS"
+	EnvCredentialVaultRequireScopedMatch = "OPENSANDBOX_EGRESS_CREDENTIAL_VAULT_REQUIRE_SCOPED_MATCH"
+)
 
-// Fleet profile: the egress control plane serves N sandboxes
+// Fast Sandbox profile: the egress control plane serves N sandboxes
 // sharing one host/network domain; sidecar remains the default profile.
 const (
 	EnvEgressProfile  = "OPENSANDBOX_EGRESS_PROFILE"
@@ -31,9 +34,9 @@ const (
 
 const (
 	ProfileSidecar = "sidecar"
-	// ProfileFleet: one egress control plane serving N sandboxes sharing one
+	// ProfileFastSandbox: one egress control plane serving N sandboxes sharing one
 	// host/network domain (fast-sandbox Fastlet Pod).
-	ProfileFleet = "fleet"
+	ProfileFastSandbox = "fast-sandbox"
 )
 
 // Sandbox Actions Handler protocol (fast-sandbox, docs/concepts/
@@ -49,7 +52,7 @@ const (
 	HookDataPlaneReady = "sandbox.data-plane-ready"
 )
 
-// Fleet-profile HTTP listener and trust model: the listener binds the Pod
+// Fast Sandbox-profile HTTP listener and trust model: the listener binds the Pod
 // netns loopback only; the fastlet proxy and the Fastlet's action dispatcher
 // are the only peers. The proxy injects the UID header that routes a push to
 // its subject; the action dispatcher carries the identity in the envelope.
@@ -84,11 +87,29 @@ const (
 	EnvMitmproxyPort             = "OPENSANDBOX_EGRESS_MITMPROXY_PORT"
 	EnvMitmproxyScript           = "OPENSANDBOX_EGRESS_MITMPROXY_SCRIPT"
 	EnvMitmproxyUpstreamTrustDir = "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_TRUST_DIR"
-	EnvMitmproxySslInsecure      = "OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE"
+	// EnvMitmproxyUpstreamExtraCA: path to a PEM file with one or more extra CA
+	// certificates, passed to mitmproxy ssl_verify_upstream_trusted_ca. Additive
+	// with the system/confdir trust, and applies to every mitmproxy upstream TLS
+	// connection (HTTPS proxy and intercepted origins), not only the proxy hop.
+	EnvMitmproxyUpstreamExtraCA = "OPENSANDBOX_EGRESS_MITMPROXY_UPSTREAM_EXTRA_CA"
+	EnvMitmproxySslInsecure     = "OPENSANDBOX_EGRESS_MITMPROXY_SSL_INSECURE"
+	// EnvExperimentalRevisionRuntime enables the internal OSEP-0023
+	// per-mitmdump revision bootstrap path. It is not a public interception mode.
+	EnvExperimentalRevisionRuntime = "OPENSANDBOX_EGRESS_EXPERIMENTAL_REVISION_RUNTIME"
 	// EnvMitmproxyExtraPorts (EXPERIMENTAL): extra TCP dports to intercept,
 	// appended to the always-on 80,443. Comma-separated. May change or be
 	// removed without notice.
 	EnvMitmproxyExtraPorts = "OPENSANDBOX_EGRESS_MITMPROXY_EXTRA_PORTS"
+
+	// EnvUpstreamProxy: chained upstream proxy endpoint ("http://host:port" or
+	// "https://host:port"). When set, the bundled upstream_proxy.py addon is
+	// loaded and all mitm-handled egress is chained through it (fail-closed:
+	// anything that cannot be chained is refused). Empty = disabled.
+	EnvUpstreamProxy = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY"
+	// EnvUpstreamProxyAuth: complete Proxy-Authorization header value sent on
+	// the upstream CONNECT (e.g. "Basic base64(user:pass)"). Requires
+	// EnvUpstreamProxy. Never logged.
+	EnvUpstreamProxyAuth = "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH"
 
 	// Comma-separated upstream resolvers: literal IP only (optional :port) — no hostnames (see dnsproxy REDIRECT note).
 	EnvDNSUpstream                 = "OPENSANDBOX_EGRESS_DNS_UPSTREAM"
@@ -104,12 +125,12 @@ const (
 
 const (
 	DefaultEgressServerAddr      = ":18080"
-	DefaultFleetServerAddr       = "127.0.0.1:18080"
+	DefaultFastSandboxServerAddr = "127.0.0.1:18080"
 	DefaultMitmproxyPort         = 18081
 	DefaultCredentialProxySocket = "/run/opensandbox/credential-proxy/active.sock"
 	ResolvNameserverCap          = 10
 	DefaultMaxEgressRules        = 4096
-	DefaultDNSUpstreamTimeoutSec = 5
+	DefaultDNSUpstreamTimeoutSec = 2
 	OpenSandboxRootDir           = "/opt/opensandbox"
 )
 

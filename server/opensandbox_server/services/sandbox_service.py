@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -49,6 +49,9 @@ class SandboxService(ABC):
 
     def set_tenant_provider(self, provider: object) -> None:
         """Inject tenant provider (no-op for non-K8s implementations)."""
+
+    def close(self) -> None:
+        """Release service-owned background readers and connections."""
 
     @staticmethod
     def generate_sandbox_id() -> str:

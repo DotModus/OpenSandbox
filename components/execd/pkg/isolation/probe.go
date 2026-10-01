@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -63,7 +63,6 @@ type ProbeConfig struct {
 func Probe(cfg ProbeConfig) ProbeResult {
 	result := ProbeResult{}
 
-	// Check if bwrap binary is available.
 	version, err := probeBwrapVersion()
 	if err != nil {
 		result.Message = fmt.Sprintf("bwrap not found: %v (searched: $PATH, /opt/opensandbox/bwrap, /usr/bin/bwrap, /usr/local/bin/bwrap)", err)
@@ -117,7 +116,6 @@ func setBwrapModeAvailability(result *ProbeResult, setprivErr, setprivIdentitySw
 	result.Available = result.SetprivAvailable || result.UsernsAvailable
 }
 
-// probeBwrapVersion returns the bwrap version string if available.
 func probeBwrapVersion() (string, error) {
 	p := findBwrap()
 	if p == "" {
@@ -139,7 +137,6 @@ func probeBwrapVersion() (string, error) {
 
 var bwrapVersionRe = regexp.MustCompile(`b(?:ubble)?wrap\s+(\d+\.\d+\.\d+)`)
 
-// parseBwrapVersion extracts the version number from bwrap --version output.
 func parseBwrapVersion(out string) string {
 	match := bwrapVersionRe.FindStringSubmatch(out)
 	if len(match) < 2 {

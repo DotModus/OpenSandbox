@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package routescope verifies the tenant-scoped routing handle shared by the
-// fleets server adapter and ingress gateway.
+// Fast Sandbox server adapter and ingress gateway.
 package routescope
 
 import (
@@ -31,7 +31,7 @@ import (
 
 const (
 	prefix       = "f1"
-	canonicalTag = "opensandbox-fleets-route-v1"
+	canonicalTag = "opensandbox-fsb-route-v1"
 	macBytes     = 16
 )
 

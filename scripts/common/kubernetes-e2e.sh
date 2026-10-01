@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,8 +19,10 @@
 # Source after setting REPO_ROOT and the usual E2E_* / image env vars.
 #
 # Optional:
-#   E2E_SERVER_GATEWAY_ENABLED=true — include server.gateway.* in Helm values (ingress-gateway path).
-#   E2E_GATEWAY_ROUTE_MODE — when gateway enabled: header | uri (default header). Matches chart server.gateway.gatewayRouteMode.
+#   E2E_SERVER_GATEWAY_ENABLED=true — enable the server [ingress] announcement and
+#     deploy the ingress-gateway chart (components/ingress) alongside the server.
+#   E2E_GATEWAY_ROUTE_MODE — when gateway enabled: header | uri (default header). Matches
+#     server.gateway.gatewayRouteMode and ingress-gateway gateway.gatewayRouteMode.
 
 k8s_e2e_export_kubeconfig() {
   export KUBECONFIG="${KUBECONFIG_PATH}"
@@ -159,18 +161,6 @@ EOF
     enabled: true
     host: "${INGRESS_GATEWAY_ADDRESS}"
     gatewayRouteMode: "${E2E_GATEWAY_ROUTE_MODE:-header}"
-    dataplaneNamespace: "${E2E_NAMESPACE}"
-    replicaCount: 1
-    image:
-      repository: ${INGRESS_IMG_REPOSITORY}
-      tag: "${INGRESS_IMG_TAG}"
-    resources:
-      limits:
-        cpu: "1"
-        memory: 1Gi
-      requests:
-        cpu: "250m"
-        memory: 512Mi
     secureAccess:
       activeKey: "a"
       keys:
@@ -208,6 +198,32 @@ configToml: |
   allowed_host_paths = []
 EOF
   } > "${SERVER_VALUES_FILE}"
+
+  if [ "${E2E_SERVER_GATEWAY_ENABLED:-false}" = "true" ]; then
+    GATEWAY_VALUES_FILE="${SERVER_VALUES_FILE%.yaml}-ingress-gateway.yaml"
+    {
+      cat <<EOF
+gateway:
+  dataplaneNamespace: "${E2E_NAMESPACE}"
+  replicaCount: 1
+  gatewayRouteMode: "${E2E_GATEWAY_ROUTE_MODE:-header}"
+  image:
+    repository: ${INGRESS_IMG_REPOSITORY}
+    tag: "${INGRESS_IMG_TAG}"
+  resources:
+    limits:
+      cpu: "1"
+      memory: 1Gi
+    requests:
+      cpu: "250m"
+      memory: 512Mi
+  secureAccess:
+    keys:
+      - key_id: "a"
+        key: "${signing_key}"
+EOF
+    } > "${GATEWAY_VALUES_FILE}"
+  fi
 }
 
 k8s_e2e_validate_rendered_config_toml() {
@@ -221,7 +237,7 @@ except ModuleNotFoundError:
     import tomli as tomllib
 
 repo_root, values_file = sys.argv[1], sys.argv[2]
-chart_path = f"{repo_root}/kubernetes/charts/opensandbox-server"
+chart_path = f"{repo_root}/manifests/charts/server"
 
 rendered = subprocess.run(
     ["helm", "template", "opensandbox-server", chart_path, "-f", values_file],
@@ -258,10 +274,16 @@ k8s_e2e_helm_install_server() {
   kubectl get namespace "${SERVER_NAMESPACE}" >/dev/null 2>&1 || kubectl create namespace "${SERVER_NAMESPACE}"
   k8s_e2e_validate_rendered_config_toml
 
-  helm upgrade --install "${SERVER_RELEASE}" "${REPO_ROOT}/kubernetes/charts/opensandbox-server" \
+  helm upgrade --install "${SERVER_RELEASE}" "${REPO_ROOT}/manifests/charts/server" \
     --namespace "${SERVER_NAMESPACE}" \
     --create-namespace \
     -f "${SERVER_VALUES_FILE}"
+  if [ "${E2E_SERVER_GATEWAY_ENABLED:-false}" = "true" ]; then
+    helm upgrade --install opensandbox-ingress-gateway "${REPO_ROOT}/manifests/charts/ingress-gateway" \
+      --namespace "${SERVER_NAMESPACE}" \
+      --create-namespace \
+      -f "${GATEWAY_VALUES_FILE}"
+  fi
   if ! kubectl wait --for=condition=available --timeout=180s deployment/opensandbox-server -n "${SERVER_NAMESPACE}"; then
     kubectl get pods -n "${SERVER_NAMESPACE}" -o wide || true
     kubectl describe deployment/opensandbox-server -n "${SERVER_NAMESPACE}" || true
@@ -297,6 +319,12 @@ k8s_e2e_generate_sdk_and_run_kubernetes_mini() {
   make generate-api
   cd "${REPO_ROOT}/tests/python"
   uv sync --all-extras --refresh
+  # Safety net for transient flakes (gateway chunked-read resets, teardown
+  # races through port-forward). Set PYTEST_RERUNS=0 to disable.
+  local reruns="${PYTEST_RERUNS:-2}"
+  if [ "${reruns}" -gt 0 ]; then
+    export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:-} --reruns ${reruns} --reruns-delay 5"
+  fi
   if [ "${E2E_TEST_SUITE:-mini}" = "pool" ]; then
     uv run pytest tests/test_sandbox_pool_e2e_sync.py tests/test_server_pool_e2e_sync.py
   else

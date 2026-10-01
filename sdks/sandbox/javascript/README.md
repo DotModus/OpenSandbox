@@ -27,7 +27,7 @@ yarn add @alibaba-group/opensandbox
 
 The following example shows how to create a sandbox and execute a shell command.
 
-> **Note**: Before running this example, ensure the OpenSandbox service is running. See the root [README.md](../../../README.md) for startup instructions.
+> **Note**: Before running this example, ensure the OpenSandbox service is running. See the root [README](https://github.com/opensandbox-group/OpenSandbox#readme) for startup instructions.
 
 ```ts
 import { ConnectionConfig, Sandbox, SandboxException } from "@alibaba-group/opensandbox";
@@ -101,9 +101,43 @@ try {
 }
 ```
 
-`InMemoryPoolStateStore` is process-local. Applications that share a logical
-pool across processes must provide a distributed `PoolStateStore` whose take,
-membership, and primary-lock operations are atomic.
+`InMemoryPoolStateStore` is process-local. For a distributed pool, install a
+Redis client only in the application that needs it and import the optional
+pool subpath:
+
+```bash
+npm install redis
+```
+
+```ts
+import { createClient } from "redis";
+import { RedisPoolStateStore } from "@alibaba-group/opensandbox/pool-redis";
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+
+const stateStore = new RedisPoolStateStore({ client: redis });
+```
+
+The SDK does not import `redis` from its main entry point and does not create,
+connect, or close the injected client. Any compatible client that implements
+`sendCommand(string[])` can be used.
+
+Pool warmup is admitted at `warmupCreateQps` per one-second reconcile tick.
+Creation is asynchronous; `warmupConcurrency` limits the post-create readiness,
+preparation, renewal, and commit stages. Use `warmupSandboxPreparer`,
+`warmupPostPrepareHealthCheck`, and the corresponding timeout/polling options
+for staged warmup. Set `connectionConfig.enableTracing` to emit OpenTelemetry
+`pool.warmup` traces with one child span per stage.
+
+`SandboxPoolManager.destroy(poolName)` writes a shared `DESTROYING` fence,
+drains and best-effort kills visible idle sandboxes, clears persistent pool
+state, and writes a `DESTROYED` tombstone. `drainTimeoutSeconds` is checked
+before each drain attempt and bounds in-flight sandbox deletion; set it to `0`
+to disable that bound. State-store calls remain subject to the store client's
+own request timeout. If drain or persistent-state cleanup cannot finish, the
+namespace remains fenced as `DESTROYING`. Retry `destroy()` with the same pool
+name to finish cleanup.
 
 ## Usage Examples
 
@@ -205,7 +239,74 @@ const { endpoint } = await sandbox.getEndpoint(44772);
 const url = await sandbox.getEndpointUrl(44772);
 ```
 
-### 6. Volume Mounts
+### 6. Snapshots (Manager)
+
+`SandboxManager` administers sandbox snapshots — capture a sandbox's
+state and restore new sandboxes from it via `snapshotId`:
+
+```ts
+import { SandboxManager } from "@alibaba-group/opensandbox";
+
+const manager = SandboxManager.create({ connectionConfig: config });
+
+// Create a snapshot from a running sandbox, then wait until it is Ready
+const snapshot = await manager.createSnapshot(sandboxId, {
+  name: "pre-migration",
+});
+let info = await manager.getSnapshot(snapshot.id);
+while (info.status.state === "Creating") {
+  await new Promise((r) => setTimeout(r, 2000));
+  info = await manager.getSnapshot(snapshot.id);
+}
+
+// List all snapshots
+const page = await manager.listSnapshots();
+
+// Restore: create a new sandbox FROM a snapshot (exactly one of
+// image / snapshotId must be provided)
+const restored = await Sandbox.create({
+  connectionConfig: config,
+  snapshotId: snapshot.id,
+});
+
+// Only delete the snapshot after the restore has succeeded
+await manager.deleteSnapshot(snapshot.id);
+```
+
+### 7. Isolated Sessions
+
+Isolated sessions run multi-step code in a hardened, resource-bounded
+environment with bind mounts — reachable through `sandbox.isolation`:
+
+```ts
+const session = await sandbox.isolation.create({
+  workspace: { path: "/workspace", mode: "rw" },
+  profile: "strict",
+  // Optional bind mounts (source on host, dest inside the session)
+  binds: [{ source: "/data", dest: "/data", readonly: true }],
+});
+
+const run = await session.run("python -c 'print(1+1)'", {
+  // timeout_seconds: 30, // seconds; applies to run() only —
+  // runBackground() deliberately ignores it (background runs are not time-limited)
+});
+console.log(run.logs.stdout[0]?.text);
+
+// Background runs: start, poll until finished, then fetch logs.
+// NOTE: field names are snake_case (run_id) — they mirror the raw API
+// response and are NOT converted to camelCase.
+const bg = await session.runBackground("make build");
+let status = await session.getRunStatus(bg.run_id);
+while (status.running) {
+  await new Promise((r) => setTimeout(r, 2000));
+  status = await session.getRunStatus(bg.run_id);
+}
+const logs = await session.getRunLogs(bg.run_id);
+
+await session.delete();
+```
+
+### 8. Volume Mounts
 
 `volumes` supports `host`, `pvc`, and `ossfs` backends. Each volume must specify exactly one backend.
 
@@ -230,7 +331,7 @@ const sandbox = await Sandbox.create({
 });
 ```
 
-### 7. Sandbox Management (Admin)
+### 9. Sandbox Management (Admin)
 
 Use `SandboxManager` for administrative tasks and finding existing sandboxes.
 
@@ -255,17 +356,22 @@ The `ConnectionConfig` class manages API server connection settings.
 Runtime notes:
 
 - In browsers, the SDK uses the global `fetch` implementation.
-- In Node.js, every `Sandbox` and `SandboxManager` clones the base `ConnectionConfig` via `withTransportIfMissing()`, so each instance gets an isolated `undici` keep-alive pool. Call `sandbox.close()` or `manager.close()` when you are done so the SDK can release the associated agent.
+- In Node.js, every `Sandbox` and `SandboxManager` gets its own transport via `withTransportIfMissing()` unless you pass an already-initialized `ConnectionConfig`; shared configs are reused, and the SDK only closes transports it allocated itself. Call `sandbox.close()` or `manager.close()` when you are done so the SDK can release the agent it owns.
 
 | Parameter               | Description                                                                                                  | Default          | Environment Variable   |
 | ----------------------- | ------------------------------------------------------------------------------------------------------------ | ---------------- | ---------------------- |
 | `apiKey`                | API key for authentication                                                                                   | Optional         | `OPEN_SANDBOX_API_KEY` |
-| `domain`                | Sandbox service domain (`host[:port]`)                                                                       | `localhost:8080` | `OPEN_SANDBOX_DOMAIN`  |
+| `domain`                | Sandbox service domain (`host[:port]`), or a full base URL including a path prefix (e.g. `https://gw.example.com/opensandbox`) | `localhost:8080` | `OPEN_SANDBOX_DOMAIN`  |
 | `protocol`              | HTTP protocol (`http`/`https`)                                                                               | `http`           | -                      |
 | `requestTimeoutSeconds` | Request timeout applied to SDK HTTP calls                                                                    | `30`             | -                      |
 | `debug`                 | Enable basic HTTP debug logging                                                                              | `false`          | -                      |
 | `headers`               | Extra headers applied to every request                                                                       | `{}`             | -                      |
 | `useServerProxy`        | Use sandbox server as proxy for execd/endpoint requests (e.g. when client cannot reach the sandbox directly) | `false`          | -                      |
+| `endpointCacheTtlMs`    | How long a cached sandbox endpoint stays valid                                                               | `600000`         | -                      |
+| `endpointCacheSize`     | Maximum number of cached endpoints                                                                           | `1024`           | -                      |
+| `endpointCacheDisabled` | Disable endpoint caching entirely                                                                            | `false`          | -                      |
+| `disableMetrics`        | Opt out of create-latency telemetry                                                                          | `false`          | `OPENSANDBOX_DISABLE_METRICS=1` |
+| `enableTracing`         | Emit pool trace context headers                                                                              | `false`          | -                      |
 
 ```ts
 import { ConnectionConfig } from "@alibaba-group/opensandbox";
@@ -374,7 +480,7 @@ await sandbox.credentialVault.create({
 });
 ```
 
-See [Credential Vault](../../../docs/guides/credential-vault.md) for auth types,
+See [Credential Vault](https://github.com/opensandbox-group/OpenSandbox/blob/main/docs/guides/credential-vault.md) for auth types,
 binding guidance, and Git/curl examples.
 
 ### 5. Resource cleanup

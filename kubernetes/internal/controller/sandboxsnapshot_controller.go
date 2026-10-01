@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package controller
 
 import (
 	"context"
+	"text/template"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -33,31 +34,31 @@ import (
 )
 
 const (
-	// SandboxSnapshotFinalizer is the finalizer for SandboxSnapshot cleanup
-	SandboxSnapshotFinalizer = "sandboxsnapshot.sandbox.opensandbox.io/cleanup"
+	// sandboxSnapshotFinalizer is the finalizer for SandboxSnapshot cleanup
+	sandboxSnapshotFinalizer = "sandboxsnapshot.sandbox.opensandbox.io/cleanup"
 
-	// DefaultCommitJobTimeout is the default timeout for commit jobs
-	DefaultCommitJobTimeout = 10 * time.Minute
+	// defaultCommitJobTimeout is the default timeout for commit jobs
+	defaultCommitJobTimeout = 10 * time.Minute
 
 	// DefaultCommitJobBackoffLimit bounds commit/push retries so stable failures
 	// surface as snapshot failures within the pause/resume e2e timeout window while
 	// still tolerating a few transient job failures.
 	DefaultCommitJobBackoffLimit int32 = 3
 
-	DefaultTTLSecondsAfterFinished = 300
+	defaultTTLSecondsAfterFinished = 300
 
-	// CommitJobContainerName is the container name in commit job
-	CommitJobContainerName = "commit"
+	// commitJobContainerName is the container name in commit job
+	commitJobContainerName = "commit"
 
 	// ContainerdSocketPath is the default containerd socket path
 	ContainerdSocketPath = "/var/run/containerd/containerd.sock"
 
-	// ContainerdFIFODir is available to image-committer implementations that
+	// containerdFIFODir is available to image-committer implementations that
 	// use containerd task exec with FIFO-backed process I/O.
-	ContainerdFIFODir = "/run/containerd/fifo"
+	containerdFIFODir = "/run/containerd/fifo"
 
-	// LabelSandboxSnapshotName is the label key for sandbox snapshot name
-	LabelSandboxSnapshotName = "sandbox.opensandbox.io/sandbox-snapshot-name"
+	// labelSandboxSnapshotName is the label key for sandbox snapshot name
+	labelSandboxSnapshotName = "sandbox.opensandbox.io/sandbox-snapshot-name"
 )
 
 // SandboxSnapshotReconciler reconciles a SandboxSnapshot object.
@@ -80,6 +81,9 @@ type SandboxSnapshotReconciler struct {
 
 	// SnapshotRegistry is the OCI registry for snapshot images (from Controller Manager startup params)
 	SnapshotRegistry string
+
+	// SnapshotImageURITemplate overrides image naming; nil uses DefaultSnapshotImageURITemplate.
+	SnapshotImageURITemplate *template.Template
 
 	// SnapshotPushSecret is the K8s Secret name for pushing to registry (from Controller Manager startup params)
 	SnapshotPushSecret string
@@ -126,8 +130,8 @@ func (r *SandboxSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Add finalizer if not present
-	if !controllerutil.ContainsFinalizer(snapshot, SandboxSnapshotFinalizer) {
-		if err := utils.UpdateFinalizer(r.Client, snapshot, utils.AddFinalizerOpType, SandboxSnapshotFinalizer); err != nil {
+	if !controllerutil.ContainsFinalizer(snapshot, sandboxSnapshotFinalizer) {
+		if err := utils.UpdateFinalizer(r.Client, snapshot, utils.AddFinalizerOpType, sandboxSnapshotFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{RequeueAfter: time.Millisecond * 100}, nil

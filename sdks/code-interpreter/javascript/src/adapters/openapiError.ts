@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,15 +42,14 @@ export function throwOnOpenApiFetchError(
     (rawFragment && rawFragment.length > 0 ? rawFragment : fallbackMessage);
 
   const code = err?.code ?? err?.error?.code;
-  const msg = err?.message ?? err?.error?.message ?? message;
 
   throw new SandboxApiException({
-    message: msg,
+    message,
     statusCode: status,
     requestId,
     error: code
-      ? new SandboxError(String(code), String(msg ?? ""))
-      : new SandboxError(SandboxError.UNEXPECTED_RESPONSE, String(msg ?? "")),
+      ? new SandboxError(String(code), message)
+      : new SandboxError(SandboxError.UNEXPECTED_RESPONSE, message),
     rawBody: result.error,
   });
 }

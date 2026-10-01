@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,9 +37,9 @@ func TestContractFromPodParsesQEMU(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
 			AnnotationCheckpointProvider:    ProviderQEMU,
 			AnnotationQEMUContainer:         "main",
-			AnnotationQEMUQMPSocket:         "/run/opensandbox/qemu/qmp.sock",
-			AnnotationQEMULaunchManifest:    "/run/opensandbox/qemu/launch.json",
-			AnnotationQEMURequiredNodeClass: "shenlong-v1",
+			annotationQEMUQMPSocket:         "/run/opensandbox/qemu/qmp.sock",
+			annotationQEMULaunchManifest:    "/run/opensandbox/qemu/launch.json",
+			annotationQEMURequiredNodeClass: "shenlong-v1",
 		}},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{
 			Name:          "main",
@@ -81,8 +81,8 @@ func TestContractFromPodRejectsInvalidQEMUContract(t *testing.T) {
 			annotations: map[string]string{
 				AnnotationCheckpointProvider: ProviderQEMU,
 				AnnotationQEMUContainer:      "main",
-				AnnotationQEMUQMPSocket:      "run/qmp.sock",
-				AnnotationQEMULaunchManifest: "/run/launch.json",
+				annotationQEMUQMPSocket:      "run/qmp.sock",
+				annotationQEMULaunchManifest: "/run/launch.json",
 			},
 			wantError: "clean absolute path",
 		},

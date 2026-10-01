@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -45,6 +45,18 @@ import (
 func (r *SandboxSnapshotReconciler) handlePending(ctx context.Context, snapshot *sandboxv1alpha1.SandboxSnapshot) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// A retry must keep the targets already recorded for an existing commit Job.
+	existingJob := &batchv1.Job{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: snapshot.Namespace, Name: r.getJobName(snapshot)}, existingJob); err == nil {
+		log.Info("Commit job already exists", "job", existingJob.Name)
+		if err := r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseCommitting, "Committing", "Commit job already exists"); err != nil {
+			return ctrl.Result{}, fmt.Errorf("update snapshot status for existing commit job: %w", err)
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	} else if !errors.IsNotFound(err) {
+		return ctrl.Result{}, err
+	}
+
 	if r.SnapshotRegistry == "" {
 		msg := "snapshot-registry not configured in controller manager"
 		log.Error(nil, msg)
@@ -88,17 +100,16 @@ func (r *SandboxSnapshotReconciler) handlePending(ctx context.Context, snapshot 
 		sourceContainers = bs.Spec.Template.Spec.Containers
 	}
 
-	var containers []sandboxv1alpha1.ContainerSnapshot
-	for _, c := range sourceContainers {
-		imageURI := r.snapshotImageURI(snapshot, bs, c.Name)
-		containers = append(containers, sandboxv1alpha1.ContainerSnapshot{
-			ContainerName: c.Name,
-			ImageURI:      imageURI,
-		})
-	}
-	if len(containers) == 0 {
+	if len(sourceContainers) == 0 {
 		msg := fmt.Sprintf("no containers found in BatchSandbox %s template", bs.Name)
 		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "NoContainers", msg)
+		return ctrl.Result{}, nil
+	}
+	containers, vmStateImageURI, err := r.resolveSnapshotImages(snapshot, bs, sourceContainers, workloadContract.Provider == snapshotcontract.ProviderQEMU)
+	if err != nil {
+		if statusErr := r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "InvalidSnapshotImage", err.Error()); statusErr != nil {
+			return ctrl.Result{}, fmt.Errorf("persist snapshot image validation failure: %w", statusErr)
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -110,20 +121,11 @@ func (r *SandboxSnapshotReconciler) handlePending(ctx context.Context, snapshot 
 	snapshot.Status.Format = snapshotFormat
 	snapshot.Status.Containers = containers
 
-	job, err := r.buildCommitJob(snapshot, string(pod.UID), workloadContract)
+	job, err := r.buildCommitJob(snapshot, string(pod.UID), vmStateImageURI, workloadContract)
 	if err != nil {
 		msg := fmt.Sprintf("failed to build commit job: %v", err)
 		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseFailed, "BuildCommitJobFailed", msg)
 		return ctrl.Result{}, nil
-	}
-
-	existingJob := &batchv1.Job{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: job.Name}, existingJob); err == nil {
-		log.Info("Commit job already exists", "job", job.Name)
-		_ = r.updateSnapshotStatus(ctx, snapshot, sandboxv1alpha1.SandboxSnapshotPhaseCommitting, "Committing", "Commit job already exists")
-		return ctrl.Result{RequeueAfter: time.Second}, nil
-	} else if !errors.IsNotFound(err) {
-		return ctrl.Result{}, err
 	}
 
 	if err := r.Create(ctx, job); err != nil {
@@ -211,8 +213,8 @@ func (r *SandboxSnapshotReconciler) handleDeletion(ctx context.Context, snapshot
 		log.Info("Deleted unpause job", "job", unpauseJobName)
 	}
 
-	if controllerutil.ContainsFinalizer(snapshot, SandboxSnapshotFinalizer) {
-		if err := utils.UpdateFinalizer(r.Client, snapshot, utils.RemoveFinalizerOpType, SandboxSnapshotFinalizer); err != nil {
+	if controllerutil.ContainsFinalizer(snapshot, sandboxSnapshotFinalizer) {
+		if err := utils.UpdateFinalizer(r.Client, snapshot, utils.RemoveFinalizerOpType, sandboxSnapshotFinalizer); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -236,7 +238,7 @@ func (r *SandboxSnapshotReconciler) findPodForSandbox(ctx context.Context, bs *s
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList,
 		client.InNamespace(namespace),
-		client.MatchingLabels{LabelBatchSandboxNameKey: bs.Name},
+		client.MatchingLabels{labelBatchSandboxNameKey: bs.Name},
 	); err != nil {
 		return nil, fmt.Errorf("failed to list pods: %w", err)
 	}
@@ -255,33 +257,6 @@ func (r *SandboxSnapshotReconciler) findPodForSandbox(ctx context.Context, bs *s
 	}
 
 	return nil, fmt.Errorf("no running pod found for BatchSandbox %s", bs.Name)
-}
-
-func (r *SandboxSnapshotReconciler) snapshotImageURI(
-	snapshot *sandboxv1alpha1.SandboxSnapshot,
-	bs *sandboxv1alpha1.BatchSandbox,
-	containerName string,
-) string {
-	return fmt.Sprintf(
-		"%s/%s-%s:%s",
-		r.SnapshotRegistry,
-		bs.Name,
-		containerName,
-		snapshotImageTag(snapshot, bs),
-	)
-}
-
-func (r *SandboxSnapshotReconciler) vmStateImageURI(snapshot *sandboxv1alpha1.SandboxSnapshot) (string, error) {
-	if len(snapshot.Status.Containers) == 0 {
-		return "", fmt.Errorf("snapshot has no resolved container image URI")
-	}
-	rootfsImage := snapshot.Status.Containers[0].ImageURI
-	lastSlash := strings.LastIndexByte(rootfsImage, '/')
-	lastColon := strings.LastIndexByte(rootfsImage, ':')
-	if lastColon <= lastSlash || lastColon == len(rootfsImage)-1 {
-		return "", fmt.Errorf("snapshot container image %q has no tag", rootfsImage)
-	}
-	return fmt.Sprintf("%s/%s-vmstate:%s", r.SnapshotRegistry, snapshot.Spec.SandboxName, rootfsImage[lastColon+1:]), nil
 }
 
 func snapshotImageTag(snapshot *sandboxv1alpha1.SandboxSnapshot, bs *sandboxv1alpha1.BatchSandbox) string {
@@ -362,14 +337,14 @@ func commitJobSecurityContext(requiresHostPID bool) *corev1.SecurityContext {
 	return securityContext
 }
 
-func (r *SandboxSnapshotReconciler) buildCommitJob(snapshot *sandboxv1alpha1.SandboxSnapshot, sourcePodUID string, contracts ...snapshotcontract.WorkloadContract) (*batchv1.Job, error) {
+func (r *SandboxSnapshotReconciler) buildCommitJob(snapshot *sandboxv1alpha1.SandboxSnapshot, sourcePodUID, vmStateImageURI string, contracts ...snapshotcontract.WorkloadContract) (*batchv1.Job, error) {
 	jobName := r.getJobName(snapshot)
 	imageCommitterImage := r.imageCommitterImage()
 
 	fifoDirType := corev1.HostPathDirectoryOrCreate
 	volumeMounts := []corev1.VolumeMount{
 		{Name: "containerd-sock", MountPath: ContainerdSocketPath},
-		{Name: "containerd-fifo", MountPath: ContainerdFIFODir},
+		{Name: "containerd-fifo", MountPath: containerdFIFODir},
 	}
 	volumes := []corev1.Volume{
 		{
@@ -381,7 +356,7 @@ func (r *SandboxSnapshotReconciler) buildCommitJob(snapshot *sandboxv1alpha1.San
 		{
 			Name: "containerd-fifo",
 			VolumeSource: corev1.VolumeSource{
-				HostPath: &corev1.HostPathVolumeSource{Path: ContainerdFIFODir, Type: &fifoDirType},
+				HostPath: &corev1.HostPathVolumeSource{Path: containerdFIFODir, Type: &fifoDirType},
 			},
 		},
 	}
@@ -429,9 +404,8 @@ func (r *SandboxSnapshotReconciler) buildCommitJob(snapshot *sandboxv1alpha1.San
 	}
 	resources := corev1.ResourceRequirements{}
 	if workloadContract.Provider == snapshotcontract.ProviderQEMU {
-		vmStateImageURI, err := r.vmStateImageURI(snapshot)
-		if err != nil {
-			return nil, err
+		if vmStateImageURI == "" {
+			return nil, fmt.Errorf("qemu-v1 snapshot requires a resolved VM-state image URI")
 		}
 		request := snapshotcontract.Request{
 			Version:           snapshotcontract.RequestVersionV1,
@@ -481,13 +455,13 @@ func (r *SandboxSnapshotReconciler) buildCommitJob(snapshot *sandboxv1alpha1.San
 			Name:      jobName,
 			Namespace: snapshot.Namespace,
 			Labels: map[string]string{
-				LabelSandboxSnapshotName:  snapshot.Name,
-				LabelPrivilegedNodeAccess: "true",
+				labelSandboxSnapshotName:  snapshot.Name,
+				labelPrivilegedNodeAccess: "true",
 			},
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptrToInt32(DefaultCommitJobBackoffLimit),
-			TTLSecondsAfterFinished: ptrToInt32(int32(DefaultTTLSecondsAfterFinished)),
+			TTLSecondsAfterFinished: ptrToInt32(int32(defaultTTLSecondsAfterFinished)),
 			ActiveDeadlineSeconds:   ptrToInt64(int64(r.getCommitJobTimeout().Seconds())),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
@@ -496,7 +470,7 @@ func (r *SandboxSnapshotReconciler) buildCommitJob(snapshot *sandboxv1alpha1.San
 					ImagePullSecrets: r.imageCommitterPullSecrets(),
 					Containers: []corev1.Container{
 						{
-							Name:            CommitJobContainerName,
+							Name:            commitJobContainerName,
 							Image:           imageCommitterImage,
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Command:         []string{"/usr/local/bin/image-committer"},
@@ -539,11 +513,11 @@ func (r *SandboxSnapshotReconciler) applyImageCommitterPodTemplate(generated *co
 	generated.Annotations = mergeStringMaps(overlay.Annotations, generated.Annotations)
 
 	generatedContainer := generated.Spec.Containers[0]
-	commitContainer := corev1.Container{Name: CommitJobContainerName}
+	commitContainer := corev1.Container{Name: commitJobContainerName}
 	commitCount := 0
 	containers := make([]corev1.Container, 0, len(overlay.Spec.Containers)+1)
 	for _, container := range overlay.Spec.Containers {
-		if container.Name != CommitJobContainerName {
+		if container.Name != commitJobContainerName {
 			containers = append(containers, container)
 			continue
 		}
@@ -551,7 +525,7 @@ func (r *SandboxSnapshotReconciler) applyImageCommitterPodTemplate(generated *co
 		commitContainer = container
 	}
 	if commitCount > 1 {
-		return fmt.Errorf("image-committer Pod template contains multiple %q containers", CommitJobContainerName)
+		return fmt.Errorf("image-committer Pod template contains multiple %q containers", commitJobContainerName)
 	}
 
 	commitContainer.Name = generatedContainer.Name
@@ -725,7 +699,7 @@ func (r *SandboxSnapshotReconciler) ensureUnpauseJob(ctx context.Context, snapsh
 	// do secure container matching on unpause, consistent with the commit path.
 	if sourcePodUID != "" {
 		for i := range job.Spec.Template.Spec.Containers {
-			if job.Spec.Template.Spec.Containers[i].Name == CommitJobContainerName {
+			if job.Spec.Template.Spec.Containers[i].Name == commitJobContainerName {
 				job.Spec.Template.Spec.Containers[i].Env = append(
 					job.Spec.Template.Spec.Containers[i].Env,
 					corev1.EnvVar{Name: "SOURCE_POD_UID", Value: sourcePodUID},
@@ -769,13 +743,13 @@ func (r *SandboxSnapshotReconciler) buildUnpauseJob(snapshot *sandboxv1alpha1.Sa
 			Name:      r.getUnpauseJobName(snapshot),
 			Namespace: snapshot.Namespace,
 			Labels: map[string]string{
-				LabelSandboxSnapshotName:  snapshot.Name,
-				LabelPrivilegedNodeAccess: "true",
+				labelSandboxSnapshotName:  snapshot.Name,
+				labelPrivilegedNodeAccess: "true",
 			},
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptrToInt32(0),
-			TTLSecondsAfterFinished: ptrToInt32(int32(DefaultTTLSecondsAfterFinished)),
+			TTLSecondsAfterFinished: ptrToInt32(int32(defaultTTLSecondsAfterFinished)),
 			ActiveDeadlineSeconds:   ptrToInt64(int64(r.getCommitJobTimeout().Seconds())),
 			Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{
@@ -784,7 +758,7 @@ func (r *SandboxSnapshotReconciler) buildUnpauseJob(snapshot *sandboxv1alpha1.Sa
 					ImagePullSecrets: r.imageCommitterPullSecrets(),
 					Containers: []corev1.Container{
 						{
-							Name:            CommitJobContainerName,
+							Name:            commitJobContainerName,
 							Image:           r.imageCommitterImage(),
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Command:         []string{"/usr/local/bin/image-committer"},
@@ -902,7 +876,7 @@ func snapshotResultFromPod(pod *corev1.Pod) (*commitJobResult, bool, error) {
 		return nil, false, nil
 	}
 	for _, status := range pod.Status.ContainerStatuses {
-		if status.Name != CommitJobContainerName || status.State.Terminated == nil {
+		if status.Name != commitJobContainerName || status.State.Terminated == nil {
 			continue
 		}
 		if status.State.Terminated.ExitCode != 0 {
@@ -926,7 +900,7 @@ func imageCommitterEnvValue(job *batchv1.Job, name string) string {
 		return ""
 	}
 	for _, container := range job.Spec.Template.Spec.Containers {
-		if container.Name != CommitJobContainerName {
+		if container.Name != commitJobContainerName {
 			continue
 		}
 		for _, env := range container.Env {

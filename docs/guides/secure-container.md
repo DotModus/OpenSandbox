@@ -194,12 +194,27 @@ Or manually edit `/etc/docker/daemon.json`:
       "path": "/usr/bin/runsc",
       "runtimeArgs": [
         "--platform=systrap",
-        "--network=host"
+        "--network=host",
+        "--overlay2=none"
       ]
     }
   }
 }
 ```
+
+::: warning Docker snapshots require `--overlay2=none`
+runsc normally keeps root filesystem changes in its own `root:self` overlay.
+Docker cannot include those changes in `docker commit`, so a Docker-backed
+OpenSandbox snapshot can report success while restoring only the original
+image. Keep `--overlay2=none` in the runtime arguments when you use snapshot,
+fork, or restore workflows. This makes sandbox writes visible to Docker's
+storage driver and therefore available to the snapshot image.
+
+Existing runsc installations created without this argument must update
+`daemon.json` and restart Docker before taking snapshots. See gVisor's
+[filesystem documentation](https://gvisor.dev/docs/user_guide/filesystem/)
+for the root filesystem overlay behavior.
+:::
 
 Restart Docker:
 
@@ -755,4 +770,3 @@ iptables v1.8.9 (legacy): can't initialize iptables table 'nat': Table does not 
 
 - **Documentation**: [OpenSandbox GitHub](https://github.com/opensandbox-group/OpenSandbox)
 - **Issues**: Report bugs via [GitHub Issues](https://github.com/opensandbox-group/OpenSandbox/issues)
-- **Design Document**: See [OSEP-0004](https://github.com/opensandbox-group/OpenSandbox/blob/main/oseps/0004-secure-container-runtime.md) for complete design details

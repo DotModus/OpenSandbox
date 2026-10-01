@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,12 +26,21 @@ import ipaddress
 import logging
 import os
 import re
+import string
 from pathlib import Path
 from typing import Any, ClassVar, Dict, Literal, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from kubernetes.utils.quantity import parse_quantity
-from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 try:  # Python 3.11+
     import tomllib  # type: ignore[attr-defined]
@@ -76,6 +85,14 @@ GATEWAY_ROUTE_MODE_URI = "uri"
 
 EGRESS_MODE_DNS = "dns"
 EGRESS_MODE_DNS_NFT = "dns+nft"
+
+# ASCII characters Go's net/url leaves unescaped in the host slot
+# (shouldEscape(c, encodeHost)); the egress component parses
+# OPENSANDBOX_EGRESS_UPSTREAM_PROXY with url.Parse, so the server validator
+# mirrors that host charset exactly. Non-ASCII stays allowed like Go.
+_UPSTREAM_PROXY_HOST_ASCII = frozenset(
+    string.ascii_letters + string.digits + "-._~!$&'()*+,;=:[]<>\""
+)
 
 
 def _is_valid_kubernetes_container_resource_name(name: str) -> bool:
@@ -358,8 +375,6 @@ class SecureAccessConfig(BaseModel):
 
 
 class GatewayRouteModeConfig(BaseModel):
-    """Routing strategy for gateway ingress exposure."""
-
     mode: Literal[
         GATEWAY_ROUTE_MODE_WILDCARD,
         GATEWAY_ROUTE_MODE_HEADER,
@@ -374,8 +389,6 @@ class GatewayRouteModeConfig(BaseModel):
 
 
 class GatewayConfig(BaseModel):
-    """Gateway mode configuration for ingress exposure."""
-
     address: str = Field(
         ...,
         description="Gateway host used to expose sandboxes (domain or IP, may include :port; scheme is not allowed).",
@@ -388,8 +401,6 @@ class GatewayConfig(BaseModel):
 
 
 class IngressConfig(BaseModel):
-    """Configuration for exposing sandbox ingress."""
-
     mode: Literal[INGRESS_MODE_DIRECT, INGRESS_MODE_GATEWAY] = Field(
         default=INGRESS_MODE_DIRECT,
         description="Ingress exposure mode (direct or gateway).",
@@ -455,8 +466,6 @@ class IngressConfig(BaseModel):
 
 
 class LogConfig(BaseModel):
-    """Logging configuration."""
-
     level: str = Field(
         default="INFO",
         description="Python logging level for the server process.",
@@ -485,7 +494,7 @@ class LogConfig(BaseModel):
         ),
     )
     file_max_bytes: int = Field(
-        default=100 * 1024 * 1024,  # 100MB
+        default=100 * 1024 * 1024,
         ge=1,
         description="Maximum size of each log file in bytes before rotation (default: 100MB).",
     )
@@ -514,8 +523,6 @@ class LogConfig(BaseModel):
 
 
 class ServerConfig(BaseModel):
-    """FastAPI server configuration."""
-
     host: str = Field(
         default="0.0.0.0",
         description="Interface bound by the lifecycle API server.",
@@ -602,15 +609,14 @@ class ServerConfig(BaseModel):
         default=None,
         ge=60,
         description=(
-            "Maximum allowed sandbox TTL in seconds for requests that specify timeout. "
+            "Maximum allowed sandbox TTL in seconds for create requests that specify timeout. "
+            "Does not apply to renew-expiration requests or cap total sandbox lifetime. "
             "Omit from config to disable the server-side upper bound."
         ),
     )
 
 
 class ProxyConfig(BaseModel):
-    """Configuration for the sandbox reverse-proxy routes."""
-
     resolve_internal: bool = Field(
         default=True,
         description=(
@@ -625,17 +631,16 @@ class ProxyConfig(BaseModel):
 
 
 class KubernetesRuntimeConfig(BaseModel):
-    """Kubernetes-specific runtime configuration."""
-
     kubeconfig_path: Optional[str] = Field(
         default=None,
         description="Absolute path to the kubeconfig file used for API authentication.",
     )
-    informer_enabled: bool = Field(
-        default=True,
+    insecure_skip_tls_verify: bool = Field(
+        default=False,
         description=(
-            "[Beta] Enable informer-backed cache for workload reads. "
-            "Keeps a watch to reduce API pressure; set false to disable."
+            "Skip TLS certificate verification for the Kubernetes API server. "
+            "Use only as a temporary workaround when in-cluster ServiceAccount CA "
+            "does not match the apiserver certificate; disable once cluster CA is fixed."
         ),
     )
     informer_resync_seconds: int = Field(
@@ -687,7 +692,40 @@ class KubernetesRuntimeConfig(BaseModel):
     )
     namespace: Optional[str] = Field(
         default=None,
-        description="Namespace used for sandbox workloads.",
+        description=(
+            "Kubernetes / fast-sandbox namespace for workload reads and "
+            "sandbox creation when no tenant is configured. With [tenants] "
+            "enabled, each tenant maps to its own namespace."
+        ),
+    )
+    # -- fsb (fast-sandbox) backend --------------------------------------
+    # Shared with the kubernetes runtime, which also serves fsb (fsb-)
+    # sandboxes side by side; unused fields are harmless per provider.
+    fastpath_endpoint: str = Field(
+        default="fast-sandbox-fastpath.opensandbox.svc:9090",
+        description="fast-sandbox Fast-Path Server gRPC endpoint.",
+    )
+    fastpath_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        description="Per-RPC gRPC deadline for FastPath calls.",
+    )
+    fastpath_wait_ready_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        description="Bounded readiness wait for DataPlaneReady after Create.",
+    )
+    fastpath_resource_pool: str = Field(
+        default="default-pool",
+        description="Default fast-sandbox SandboxPool when extensions.poolRef is unset.",
+    )
+    template_s3_publish_secret: str = Field(
+        default="sandbox-oss-credentials",
+        min_length=1,
+        description=(
+            "Secret (in the platform namespace) holding the object-store "
+            "credentials referenced by server-created SandboxTemplates."
+        ),
     )
     workload_provider: Optional[str] = Field(
         default=None,
@@ -713,15 +751,7 @@ class KubernetesRuntimeConfig(BaseModel):
     sandbox_create_poll_interval_seconds: float = Field(
         default=1.0,
         gt=0,
-        description="Polling interval in seconds when waiting for a sandbox to become ready after creation.",
-    )
-    snapshot_create_timeout_seconds: int = Field(
-        default=15 * 60,
-        ge=1,
-        description=(
-            "Timeout in seconds to wait for a Kubernetes public snapshot to become ready. "
-            "Set this greater than the controller snapshot commit-job-timeout."
-        ),
+        description="Fallback status-check interval in seconds when no workload change notification arrives during creation.",
     )
     execd_init_resources: Optional["ExecdInitResources"] = Field(
         default=None,
@@ -741,8 +771,6 @@ class KubernetesRuntimeConfig(BaseModel):
 
 
 class ExecdInitResources(BaseModel):
-    """Resource requests and limits for the execd init container."""
-
     limits: Optional[Dict[str, str]] = Field(
         default=None,
         description='Resource limits, e.g. {cpu = "100m", memory = "128Mi"}.',
@@ -754,8 +782,6 @@ class ExecdInitResources(BaseModel):
 
 
 class AgentSandboxRuntimeConfig(BaseModel):
-    """Agent-sandbox runtime configuration."""
-
     template_file: Optional[str] = Field(
         default=None,
         description="Path to Sandbox CR YAML template file for agent-sandbox.",
@@ -771,8 +797,6 @@ class AgentSandboxRuntimeConfig(BaseModel):
 
 
 class StorageConfig(BaseModel):
-    """Volume and storage configuration for sandbox mounts."""
-
     allowed_host_paths: list[str] = Field(
         default_factory=list,
         description=(
@@ -799,9 +823,176 @@ class StorageConfig(BaseModel):
 
 DEFAULT_EGRESS_DISABLE_IPV6 = True
 
-class EgressConfig(BaseModel):
-    """Egress sidecar configuration."""
 
+class EgressUpstreamProxyConfig(BaseModel):
+    """Chained upstream CONNECT proxy for the egress sidecar.
+
+    Mirrors the egress component's ``parseUpstreamProxy`` validation so an
+    invalid endpoint fails server startup instead of failing sandbox creation
+    later. Error messages never echo the configured URL: a userinfo URL would
+    otherwise leak credentials into logs.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    url: str = Field(
+        ...,
+        description=(
+            "Upstream proxy endpoint (http://host[:port] or https://host[:port]). "
+            "Injected into the egress sidecar as OPENSANDBOX_EGRESS_UPSTREAM_PROXY. "
+            "Credentials, query, fragment, and paths are rejected; use "
+            "authorization for credentials."
+        ),
+        min_length=1,
+    )
+    authorization: Optional[SecretStr] = Field(
+        default=None,
+        description=(
+            "Complete Proxy-Authorization header value sent on the upstream "
+            "CONNECT (e.g. 'Basic <base64>'), injected as "
+            "OPENSANDBOX_EGRESS_UPSTREAM_PROXY_AUTH. Never logged."
+        ),
+    )
+    ca_cert_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Docker only: absolute POSIX path on the Docker daemon host to a "
+            "PEM CA bundle mounted read-only into the egress sidecar."
+        ),
+    )
+    ca_secret_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Kubernetes only: Secret containing the upstream CA bundle under "
+            "the fixed ca.crt key; mounted only into the egress sidecar."
+        ),
+    )
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, url: str) -> str:
+        url = url.strip()
+        if not url:
+            raise ValueError("egress.upstream_proxy.url: value is empty")
+        # urlsplit silently strips tab/CR/LF, which Go's parser rejects —
+        # check the raw string first so both sides agree.
+        if any(ord(c) < 0x20 or c == "\x7f" for c in url):
+            raise ValueError(
+                "egress.upstream_proxy.url: control characters are not allowed"
+            )
+        if "://" not in url:
+            raise ValueError(
+                "egress.upstream_proxy.url: missing scheme, "
+                "want http://host:port or https://host:port"
+            )
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            raise ValueError("egress.upstream_proxy.url: invalid URL") from None
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                "egress.upstream_proxy.url: unsupported scheme, want http or https"
+            )
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or "@" in parsed.netloc
+        ):
+            raise ValueError(
+                "egress.upstream_proxy.url: userinfo is not allowed, "
+                "use authorization for credentials"
+            )
+        host = parsed.hostname
+        if not host:
+            raise ValueError("egress.upstream_proxy.url: missing host")
+        if "?" in url or "#" in url or parsed.query or parsed.fragment:
+            raise ValueError(
+                "egress.upstream_proxy.url: query and fragment are not allowed"
+            )
+        if parsed.path not in ("", "/"):
+            raise ValueError("egress.upstream_proxy.url: path is not allowed")
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError(
+                "egress.upstream_proxy.url: invalid port, want 1-65535"
+            ) from None
+        if port is not None and not 1 <= port <= 65535:
+            raise ValueError("egress.upstream_proxy.url: invalid port, want 1-65535")
+        # userinfo is already rejected, so a bracketed netloc means the
+        # host is an IPv6 literal where "%<zone>" is legitimate.
+        bracketed = parsed.netloc.startswith("[")
+        if "%" in host and not bracketed:
+            raise ValueError("egress.upstream_proxy.url: invalid host")
+        if any(
+            ord(c) < 0x80 and c != "%" and c not in _UPSTREAM_PROXY_HOST_ASCII
+            for c in host
+        ):
+            raise ValueError("egress.upstream_proxy.url: invalid host")
+        return url
+
+    @field_validator("authorization")
+    @classmethod
+    def validate_authorization(
+        cls, authorization: Optional[SecretStr]
+    ) -> Optional[SecretStr]:
+        if authorization is None:
+            return None
+        secret = authorization.get_secret_value()
+        if not secret.strip():
+            return None
+        if "\r" in secret or "\n" in secret:
+            raise ValueError(
+                "egress.upstream_proxy.authorization must not contain newlines"
+            )
+        return authorization
+
+    @field_validator("ca_cert_path")
+    @classmethod
+    def validate_ca_cert_path(cls, path: Optional[str]) -> Optional[str]:
+        if path is None:
+            return None
+        path = path.strip()
+        if not path:
+            raise ValueError("egress.upstream_proxy.ca_cert_path: value is empty")
+        if "\x00" in path:
+            raise ValueError(
+                "egress.upstream_proxy.ca_cert_path: NUL is not allowed"
+            )
+        # The path lives on the Docker daemon host, which may be remote —
+        # never stat it here. It must be POSIX-absolute because the bind
+        # source is resolved by the daemon (typically Linux); Path.is_absolute
+        # is platform-dependent and would reject "/x/y" when the server itself
+        # runs on Windows. ":" is rejected because it collides with the
+        # "src:dst:mode" bind syntax.
+        if not path.startswith("/") or ":" in path:
+            raise ValueError(
+                "egress.upstream_proxy.ca_cert_path must be an absolute POSIX "
+                "path without ':'"
+            )
+        return path
+
+    @field_validator("ca_secret_name")
+    @classmethod
+    def validate_ca_secret_name(cls, name: Optional[str]) -> Optional[str]:
+        if name is None:
+            return None
+        name = name.strip()
+        if not name or len(name) > 253:
+            raise ValueError(
+                "egress.upstream_proxy.ca_secret_name must be a DNS-1123 subdomain"
+            )
+        if not all(
+            0 < len(label) <= 63 and _KUBERNETES_DNS_LABEL_RE.fullmatch(label)
+            for label in name.split(".")
+        ):
+            raise ValueError(
+                "egress.upstream_proxy.ca_secret_name must be a DNS-1123 subdomain"
+            )
+        return name
+
+
+class EgressConfig(BaseModel):
     image: Optional[str] = Field(
         default=None,
         description="Container image for the egress sidecar (used when network policy is requested).",
@@ -850,6 +1041,17 @@ class EgressConfig(BaseModel):
         description=(
             "Kubernetes resource limits for the egress sidecar. Can be set independently of requests. "
             "If both are unset, the resources block is omitted (namespace LimitRange defaults may apply)."
+        ),
+    )
+    upstream_proxy: Optional[EgressUpstreamProxyConfig] = Field(
+        default=None,
+        description=(
+            "Chained upstream HTTP(S) CONNECT proxy for mitmproxy-handled egress. "
+            "Server-side only; injected as OPENSANDBOX_EGRESS_UPSTREAM_PROXY[_AUTH] "
+            "on every egress sidecar. Sandboxes created with networkPolicy must "
+            "enable transparent MITM (credentialProxy.enabled or env "
+            "OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true) or creation is rejected. "
+            'Requires mode = "dns+nft".'
         ),
     )
 
@@ -903,17 +1105,30 @@ class EgressConfig(BaseModel):
                 raise ValueError(f"resource request for {resource_name!r} ({request!r}) must not exceed limit ({limit!r})")
         return self
 
+    @model_validator(mode="after")
+    def validate_upstream_proxy_requires_dns_nft(self) -> EgressConfig:
+        # The egress sidecar refuses the upstream proxy unless
+        # OPENSANDBOX_EGRESS_MODE=dns+nft; fail at config load instead of
+        # crash-looping every sidecar.
+        if self.upstream_proxy is not None and self.mode != EGRESS_MODE_DNS_NFT:
+            raise ValueError('egress.upstream_proxy requires egress.mode = "dns+nft"')
+        return self
+
 
 class RuntimeConfig(BaseModel):
-    """Runtime selection (docker, kubernetes, etc.)."""
-
     type: Literal["docker", "kubernetes"] = Field(
         ...,
         description="Active sandbox runtime implementation.",
     )
     execd_image: str = Field(
         ...,
-        description="Container image that contains the execd binary for sandbox initialization.",
+        description=(
+            "Container image that contains the execd binary for sandbox "
+            "initialization. Docker/Kubernetes run it in-sandbox; the fsb "
+            "runtime injects it into SandboxTemplate golden-image builds "
+            "(the template builder bakes the runtime files into the guest "
+            "rootfs)."
+        ),
         min_length=1,
     )
     execd_run_as_init: bool = Field(
@@ -930,8 +1145,6 @@ class RuntimeConfig(BaseModel):
 
 
 class SecureRuntimeConfig(BaseModel):
-    """Secure container runtime configuration (gVisor, Kata, Firecracker)."""
-
     type: Literal["", "gvisor", "kata", "firecracker"] = Field(
         default="",
         description=(
@@ -960,7 +1173,6 @@ class SecureRuntimeConfig(BaseModel):
     @model_validator(mode="after")
     def validate_secure_runtime(self) -> "SecureRuntimeConfig":
         if self.type == "":
-            # No secure runtime configured
             if self.docker_runtime is not None or self.k8s_runtime_class is not None:
                 raise ValueError(
                     "docker_runtime and k8s_runtime_class must be omitted when secure_runtime.type is empty."
@@ -975,7 +1187,6 @@ class SecureRuntimeConfig(BaseModel):
                 )
             # Optional: also allow docker_runtime for consistency, but Firecracker won't use it
 
-        # For gVisor and Kata, at least one runtime must be specified
         if self.type in ("gvisor", "kata"):
             if self.docker_runtime is None and self.k8s_runtime_class is None:
                 raise ValueError(
@@ -987,8 +1198,6 @@ class SecureRuntimeConfig(BaseModel):
 
 
 class DockerConfig(BaseModel):
-    """Docker runtime specific settings."""
-
     network_mode: str = Field(
         default="host",
         description="Docker network mode for sandbox containers (host, bridge, or a custom user-defined network name).",
@@ -1055,6 +1264,18 @@ class DockerConfig(BaseModel):
             "Each sandbox needs 2–3 host ports (2 without egress, 3 with egress sidecar)."
         ),
     )
+    publish_host: str = Field(
+        default="0.0.0.0",
+        description=(
+            "Host address Docker publishes bridge-mode sandbox ports on (the HostIp of every port "
+            "binding, the egress sidecar's included). The default 0.0.0.0 publishes on every host "
+            "interface. Set an IP address to keep sandbox ports off public interfaces: 127.0.0.1 "
+            "when the server runs on the host, or the Docker bridge gateway (e.g. 172.17.0.1) when "
+            "the server runs in a container and reaches sandboxes through host-published ports. "
+            "Must be an IPv4 address (Docker does not resolve names in port bindings, and the port "
+            "probe is IPv4-only)."
+        ),
+    )
     pids_limit: Optional[int] = Field(
         default=4096,
         ge=1,
@@ -1078,6 +1299,28 @@ class DockerConfig(BaseModel):
         ),
     )
 
+    @field_validator("publish_host")
+    @classmethod
+    def validate_publish_host(cls, value: str) -> str:
+        host = (value or "").strip()
+        if not host:
+            return "0.0.0.0"
+        try:
+            parsed = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError(
+                f"docker.publish_host must be an IP address (got {value!r}): Docker publishes ports "
+                "on addresses, not names."
+            ) from exc
+        if not isinstance(parsed, ipaddress.IPv4Address):
+            # The port allocator probes with an AF_INET socket: an IPv6 literal would pass here and
+            # then fail every probe (gaierror, not EADDRNOTAVAIL), so say so at config load.
+            raise ValueError(
+                f"docker.publish_host must be an IPv4 address (got {value!r}): the port allocator "
+                "probes with an IPv4 socket."
+            )
+        return host
+
     @model_validator(mode="after")
     def validate_port_range(self) -> "DockerConfig":
         if self.port_range_min >= self.port_range_max:
@@ -1094,8 +1337,6 @@ class DockerConfig(BaseModel):
 
 
 class PostgreSQLStoreConfig(BaseModel):
-    """PostgreSQL connection and pool settings for server persistence."""
-
     dsn: Optional[SecretStr] = Field(
         default=None,
         description=(
@@ -1123,6 +1364,14 @@ class PostgreSQLStoreConfig(BaseModel):
         gt=0,
         description="Maximum time in seconds to wait for a pooled PostgreSQL connection.",
     )
+    snapshot_recovery_interval_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        description=(
+            "Interval between unfinished snapshot recovery scans when PostgreSQL is paired "
+            "with the Kubernetes runtime. This controls takeover latency, not correctness."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_pool_size(self) -> "PostgreSQLStoreConfig":
@@ -1135,8 +1384,6 @@ class PostgreSQLStoreConfig(BaseModel):
 
 
 class StoreConfig(BaseModel):
-    """Persistence backend for server-managed server resources."""
-
     type: Literal["sqlite", "postgresql"] = Field(
         default="sqlite",
         description=(
@@ -1168,8 +1415,6 @@ class StoreConfig(BaseModel):
 
 
 class TenantsConfig(BaseModel):
-    """Multi-tenant provider configuration."""
-
     provider: Literal["file", "http"] = Field(
         default="file",
         description="Tenant provider type: 'file' (tenants.toml) or 'http' (remote endpoint).",
@@ -1205,7 +1450,9 @@ class TenantsConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
-    """Root application configuration model."""
+    # Config values may be secrets (store dsn, egress upstream proxy
+    # authorization); never echo raw inputs inside validation errors.
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     server: ServerConfig = Field(default_factory=ServerConfig)
     proxy: ProxyConfig = Field(
@@ -1267,6 +1514,16 @@ class AppConfig(BaseModel):
                 )
         else:
             raise ValueError(f"Unsupported runtime type '{self.runtime.type}'.")
+        upstream_proxy = self.egress.upstream_proxy if self.egress else None
+        if upstream_proxy is not None:
+            if self.runtime.type == "docker" and upstream_proxy.ca_secret_name is not None:
+                raise ValueError(
+                    "egress.upstream_proxy.ca_secret_name requires runtime.type = 'kubernetes'"
+                )
+            if self.runtime.type == "kubernetes" and upstream_proxy.ca_cert_path is not None:
+                raise ValueError(
+                    "egress.upstream_proxy.ca_cert_path requires runtime.type = 'docker'"
+                )
         return self
 
 
@@ -1287,16 +1544,16 @@ def _resolve_config_path(path: str | Path | None = None) -> Path:
 def _load_toml_data(path: Path) -> dict[str, Any]:
     """Load TOML content from file, returning empty dict if file is missing."""
     if not path.exists():
-        logger.info("Config file %s not found. Using default configuration.", path)
+        logger.info(f"Config file {path} not found. Using default configuration.")
         return {}
 
     try:
         with path.open("rb") as fh:
             data = tomllib.load(fh)
-            logger.info("Loaded configuration from %s", path)
+            logger.info(f"Loaded configuration from {path}")
             return data
     except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to read config file %s: %s", path, exc)
+        logger.error(f"Failed to read config file {path}: {exc}")
         raise
 
 
@@ -1361,20 +1618,7 @@ def _apply_secure_access_env_overrides(config: AppConfig) -> None:
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
-    """
-    Load configuration from TOML file and store it globally.
-
-    Args:
-        path: Optional explicit config path. Falls back to SANDBOX_CONFIG_PATH env,
-              then ~/.sandbox.toml when not provided.
-
-    Returns:
-        AppConfig: Parsed application configuration.
-
-    Raises:
-        ValidationError: If the TOML contents do not match AppConfig schema.
-        Exception: For any IO or parsing errors.
-    """
+    """Load configuration from TOML file and store it globally."""
     global _config, _config_path
 
     resolved_path = _resolve_config_path(path)
@@ -1384,7 +1628,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     try:
         _config = AppConfig(**raw_data)
     except ValidationError as exc:
-        logger.error("Invalid configuration in %s: %s", resolved_path, exc)
+        logger.error(f"Invalid configuration in {resolved_path}: {exc}")
         raise
 
     _apply_env_overrides(_config)
@@ -1393,12 +1637,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
 
 
 def get_config() -> AppConfig:
-    """
-    Retrieve the currently loaded configuration, loading defaults if necessary.
-
-    Returns:
-        AppConfig: Currently active configuration.
-    """
+    """Retrieve the currently loaded configuration, loading defaults if necessary."""
     global _config
     if _config is None:
         _config = load_config()
@@ -1406,7 +1645,6 @@ def get_config() -> AppConfig:
 
 
 def get_config_path() -> Path:
-    """Return the resolved configuration path."""
     global _config_path
     if _config_path is None:
         _config_path = _resolve_config_path()
@@ -1433,6 +1671,7 @@ __all__ = [
     "PostgreSQLStoreConfig",
     "KubernetesRuntimeConfig",
     "EgressConfig",
+    "EgressUpstreamProxyConfig",
     "EGRESS_MODE_DNS",
     "EGRESS_MODE_DNS_NFT",
     "SecureRuntimeConfig",

@@ -1,3 +1,17 @@
+// Copyright 2026 The OpenSandbox Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -49,7 +63,9 @@ test("public package exports client-side pool APIs", async () => {
   assert.equal(typeof sdk.AcquirePolicy, "object");
   assert.equal(sdk.AcquirePolicy.DIRECT_CREATE, "DIRECT_CREATE");
   assert.equal(sdk.PoolLifecycleState.RUNNING, "RUNNING");
-  assert.equal(sdk.PoolHealthState.HEALTHY, "HEALTHY");
+  assert.equal(sdk.PoolState.HEALTHY, "HEALTHY");
+  assert.equal(sdk.PoolDestroyState.ACTIVE, "ACTIVE");
+  assert.equal(typeof sdk.SandboxPoolManager, "function");
   assert.equal(sdk.PooledSandboxCreateReason.WARMUP, "WARMUP");
   const exportedNames = exportedDeclarationNames(declarations);
   assert.equal(exportedNames.has("SandboxPoolOptions"), true);

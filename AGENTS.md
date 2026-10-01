@@ -48,10 +48,11 @@ Use this file as the root router for the monorepo. Prefer the nearest `AGENTS.md
 - `components/internal/`: shared Go helpers used by runtime components
 - `sdks/`: sandbox, code-interpreter, and MCP SDKs plus generated clients
 - `specs/`: public OpenAPI contracts and examples
-- `kubernetes/`: Kubernetes operator, CRDs, task-executor, Helm charts, and Kind e2e tests
+- `kubernetes/`: Kubernetes operator, CRDs, task-executor, and Kind e2e tests
+- `manifests/charts/`: Helm charts (base, controller, server, ingress-gateway, node-agent, fast-sandbox, opensandbox umbrella)
 - `cli/`: `osb` command-line client and bundled CLI skills
 - `tests/`: cross-language end-to-end SDK tests
-- `docs/`, `examples/`, `sandboxes/`, `oseps/`: documentation, samples, images/environments, and proposals
+- `docs/`, `examples/`, `oseps/`: documentation, samples, and proposals
 
 ## Routing
 
@@ -128,11 +129,10 @@ Never:
 ```
 docs/
   getting-started/     # Quick start, installation, configuration
-  architecture/        # Architecture overview, network design
+  architecture/        # Layered system docs: overview, control-plane/, data-plane/, network/
+  deployment/          # Deployment and operations (Kubernetes install, storage, metrics)
   guides/              # Feature guides (credential vault, secure container, etc.)
   sdks/                # SDK reference (one page per language per SDK)
-  components/          # Server, execd, ingress, egress
-  kubernetes/          # Kubernetes operator and deployment
   api/                 # OpenAPI spec reference
   cli/                 # CLI reference
   examples/            # One page per example

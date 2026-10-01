@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -108,7 +108,6 @@ var _ = BeforeSuite(func() {
 		Allocator:  NewDefaultAllocator(k8sManager.GetClient()),
 		RestConfig: cfg,
 	}).SetupWithManager(k8sManager, 128)).Should(Succeed())
-	// TODO more reconciler goes HERE
 
 	By("try to start manager")
 	mgrStopped = startTestManager(ctx, k8sManager)

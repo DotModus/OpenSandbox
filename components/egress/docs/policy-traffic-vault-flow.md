@@ -1,13 +1,13 @@
-# Egress Policy, Traffic Flow, and Credential Vault (Fleet Profile)
+# Egress Policy, Traffic Flow, and Credential Vault (Fast Sandbox Profile)
 
 This document shows how a sandbox's outbound network policy, its traffic flow,
-and the credential vault work in the **fleet profile**: one egress
+and the credential vault work in the **fast-sandbox profile**: one egress
 control plane serving N sandboxes that share one host/network domain
 (fast-sandbox Fastlet Pod). Each sandbox is a **subject** with its own policy,
 kernel rules, and credentials.
 
 The sidecar profile differs (single policy, `hook output`, iptables DNS
-REDIRECT on 15353); only the fleet model is drawn here.
+REDIRECT on 15353); only the fast-sandbox model is drawn here.
 
 ## 1. Subject lifecycle: fastlet action protocol → deny-first → active
 
@@ -60,7 +60,7 @@ sequenceDiagram
     participant F as Fastlet
     participant E as Egress listener<br/>(127.0.0.1:18080, loopback)
     participant R as Subject registry<br/>(memory)
-    participant N as nftables<br/>(table opensandbox-fleet)
+    participant N as nftables<br/>(table opensandbox-fast-sandbox)
     participant D as DNS proxy<br/>(gateway:53, shared)
     participant S as Server (OpenSandbox)
     participant P as fastlet-proxy
@@ -75,7 +75,7 @@ sequenceDiagram
     E->>N: atomic swap (subject chain + static sets, single nft -f)
     E->>D: per-query selector now returns this subject's policy
     Note over S,P: create-then-configure (server side)
-    S->>P: PUT /v1/sandboxfleets/{sid}/egress/credential-vault
+    S->>P: PUT /v1/sandboxes/{sid}/egress/credential-vault
     P->>E: forward (credential verified, X-Fast-Sandbox-Uid added)
     alt subject registered
         E->>E: apply vault revision (memory-only per subject)
@@ -88,7 +88,7 @@ sequenceDiagram
 ## 3. Data plane: outbound traffic flow
 
 The authoritative enforcement layer is the Pod netns `forward` hook
-(`table opensandbox-fleet`, master chain policy **accept** with an
+(`table opensandbox-fast-sandbox`, master chain policy **accept** with an
 unmarked-drop tail — the forward path never issues an explicit accept,
 because on the fast-sandbox Firecracker bridge topology
 (`bridge-nf-call-iptables=1`) an accept verdict returns the frame to the
@@ -139,9 +139,28 @@ flowchart LR
 Vault revisions are pushed over the proxy route and held **memory-only** per
 subject (OSEP-0012 model — no Secret volume, nothing written to egress disk).
 The shared mitmdump instance selects the subject's vault by the client's
-source IP (transparent REDIRECT/DNAT preserves it); a revision push rebinds
-in memory and new flows pick up the new credentials. See
-[fleet-mitm-data-plane](../../../docs/components/egress-fleet-mitm-data-plane.md).
+source IP (transparent REDIRECT/DNAT preserves it). It keeps an immutable
+snapshot per subject and conditionally checks the private Unix-socket endpoint
+for every new flow with its opaque `ETag`. An unchanged tag returns `304`
+without rendering or transferring credential material; a changed tag returns
+`200`, the full snapshot, its public revision, and a replacement `ETag`. The
+tag changes even when delete-then-create resets the public revision to `1`, so
+recreation cannot accidentally validate a pre-delete snapshot. Consequently, the
+first flow after a successful create, patch, or delete acknowledgement observes
+that mutation without a timer or cache-expiry sleep. See
+[fast-sandbox-mitm-data-plane](../../../docs/components/egress-fast-sandbox-mitm-data-plane.md).
+
+`404` has one explicit meaning for the addon: there is no active vault for the
+selected subject, so any older cached snapshot is removed and the flow remains
+ordinary non-credentialed egress. Transport timeout/refusal, `5xx`, malformed
+JSON/schema, an invalid `ETag`, or a non-advancing tag after a conditional
+request are lookup failures, not "no vault". Those failures discard the
+unconfirmed cached plaintext snapshot and fail closed for **all intercepted
+traffic**, including hosts that would not match any credential binding. The
+addon returns a local `503` when the request body is safely buffered, or kills
+a streamed/unknown-length flow before it can reach upstream. Operators should
+therefore treat the private credential-proxy socket as a hard availability
+dependency whenever transparent interception is enabled.
 
 ```mermaid
 sequenceDiagram
@@ -153,13 +172,24 @@ sequenceDiagram
     participant M as mitmdump (shared)
     participant C as Sandbox client
 
-    S->>P: PUT /v1/sandboxfleets/{sid}/egress/credential-vault (full revision)
+    S->>P: PUT /v1/sandboxes/{sid}/egress/credential-vault (full revision)
     P->>E: forward (UID header -> subject)
-    E->>V: replace revision (memory-only, new flows rebind)
+    E->>V: atomically replace revision (memory-only)
+    V-->>E: mutation response acknowledges active revision
     C->>M: HTTP(S) flow (DNAT preserves source IP)
     M->>M: script: client source IP -> subject -> subject's vault
-    M->>V: resolve credential/binding for the flow
-    V-->>M: credential (active snapshot)
+    M->>V: GET _active + If-None-Match cached opaque ETag
+    alt snapshot tag unchanged
+        V-->>M: 304 + ETag (reuse immutable snapshot)
+    else snapshot tag changed
+        V-->>M: 200 + ETag + active snapshot
+    else no active vault
+        V-->>M: 404 (clear cached snapshot)
+    else lookup/protocol failure
+        V--xM: timeout/refused/5xx/invalid payload or revision
+        M--xC: 503 or connection termination (no upstream forwarding)
+    end
+    M->>M: resolve credential/binding from one flow-fixed snapshot
     M-->>C: proxied flow with credential applied
 ```
 
@@ -174,6 +204,10 @@ sequenceDiagram
 | Unload (REMOVE_BINDING) | chain + all sets removed in one transaction; stale fence ignored |
 | Egress restart | stale rules wiped (ApplyReset); new instanceId triggers Fastlet replay of SET_BINDING + reached Hooks |
 | Unregistered source | unmarked -> master-chain tail drop — denied before the binding is ever observed |
+| Vault snapshot unchanged | per-flow conditional UDS check returns `304`; cached immutable snapshot is reused without retransmitting secrets |
+| Vault snapshot changed | opaque-tag compare and snapshot render occur under one store read lock; `200` + replacement `ETag` atomically replaces the subject cache |
+| Vault deleted / no active vault | `404` clears any cached snapshot; the flow proceeds without credential injection |
+| Vault lookup or protocol failure | fail-closed before upstream: buffered request receives `503`; streamed, chunked, or HTTP/2 unknown-length request is killed |
 | Malformed action envelope | rejected (never silently ignored); the subject is never activated |
 | data-plane-ready without pending policy | failed (protocol violation) — the subject stays denying |
 
@@ -183,7 +217,7 @@ sequenceDiagram
 |---|---|
 | Actions wire model + validation | `pkg/actionhandler` (envelope, operations, Hooks) |
 | Subject state machine | `pkg/subject` (`MemoryRegistry`, lifecycle hooks) |
-| Per-subject nft rules | `pkg/fleetnft` (dispatch rules, atomic swap, reset) |
-| Actions endpoints + lifecycle mapping | `fleet_actions.go` (SET_BINDING / LIFECYCLE_HOOK / REMOVE_BINDING) |
-| Policy/vault HTTP surface | `fleet_server.go` (UID routing, pending cache, per-subject vault) |
+| Per-subject nft rules | `pkg/fastsandboxnft` (dispatch rules, atomic swap, reset) |
+| Actions endpoints + lifecycle mapping | `fastsandbox_actions.go` (SET_BINDING / LIFECYCLE_HOOK / REMOVE_BINDING) |
+| Policy/vault HTTP surface | `fastsandbox_server.go` (UID routing, pending cache, per-subject vault) |
 | DNS per-query dispatch | `pkg/dnsproxy` `SetQueryPolicySelector` |

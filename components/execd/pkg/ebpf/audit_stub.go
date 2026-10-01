@@ -1,6 +1,6 @@
 //go:build !ebpf
 
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,4 +31,9 @@ func Init(cfg *isolation.EbpfConfig, sandboxID string) (state, message string) {
 	}
 	return "disabled",
 		"eBPF observation is not enabled ([ebpf] enabled = false)"
+}
+
+// SetSandboxID is a no-op for this build: there is no observer to attribute.
+func SetSandboxID(sandboxID string) (state, message string) {
+	return "", ""
 }

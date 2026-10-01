@@ -97,7 +97,8 @@ kubernetes/
 │   ├── manager/                   # Controller manager deployment
 │   ├── rbac/                      # ClusterRole bindings
 │   └── samples/                   # Example resources
-├── charts/opensandbox-controller/ # Helm chart
+├── ../manifests/charts/           # Helm charts (base, controller, server,
+│                                  #  ingress-gateway, node-agent, opensandbox umbrella)
 ├── test/
 │   ├── e2e/                       # Core e2e tests (Kind-based)
 │   ├── e2e_task/                  # Task-executor e2e tests
@@ -296,7 +297,7 @@ make generate    # DeepCopy methods
 Generated paths:
 - `config/crd/bases/` — CRD YAML from `apis/` type annotations
 - `pkg/client/` — clientset, informer, lister (codegen)
-- `internal/controller/allocator_mock.go` — gomock mocks (regenerate with `mockgen`)
+- `internal/controller/allocator_mock_test.go` — gomock mocks (regenerate with `mockgen`)
 
 ## Testing
 
@@ -387,7 +388,7 @@ mockStore.EXPECT().GetAllocation(gomock.Any(), gomock.Any()).Return(&PoolAllocat
    ```
 3. Implement controller logic to handle the new field
 4. Add unit tests
-5. Update CRD YAML in Helm chart (`charts/opensandbox-controller/templates/crds/`)
+5. Sync CRDs into the base Helm chart (`make -C manifests helm-gen-crds` updates `manifests/charts/base/files/crds.yaml`; `make manifests` runs it automatically)
 
 ### Adding a New Strategy Implementation
 
@@ -447,15 +448,15 @@ make undeploy    # Remove controller
 ### Deploying with Helm
 
 ```bash
-make helm-install
+make -C manifests helm-install
 # Or with custom values
-helm install opensandbox-controller ./charts/opensandbox-controller \
+helm install opensandbox-controller ../manifests/charts/controller \
   --set controller.image.repository=myregistry/controller \
   --set controller.image.tag=v0.1.0 \
   --namespace opensandbox-system --create-namespace
 ```
 
-See `docs/HELM-DEPLOYMENT.md` for full Helm documentation.
+See `../manifests/HELM-DEPLOYMENT.md` for full Helm documentation.
 
 ### Controller Configuration
 
@@ -531,6 +532,10 @@ curl -X POST http://localhost:5758/tasks -d '{"name":"test","process":{"command"
 **Allocation recovery fails on startup**: `InMemoryAllocationStore.Recover` reads all BatchSandbox annotations. If annotations are malformed, the controller will exit. Check `sandbox.opensandbox.io/alloc-status` annotation format.
 
 **Scale expectations blocking creates**: If the controller restarts mid-scale, expectations may be stale. They time out after `expectationTimeout` (default 30s).
+
+## Telemetry
+
+The controller emits OpenTelemetry metrics for the pool allocation path and capacity gauges, with OTLP export configured through standard `OTEL_*` environment variables (e.g. `OTEL_EXPORTER_OTLP_ENDPOINT`). See [docs/telemetry.md](./docs/telemetry.md) for the signal specification and configuration guide.
 
 ## Contributing
 

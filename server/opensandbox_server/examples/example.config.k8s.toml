@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -56,7 +56,11 @@ volume_default_size = "1Gi"
 type = "sqlite"
 path = "~/.opensandbox/opensandbox.db"
 # To use PostgreSQL, set type = "postgresql", configure [store.postgresql], and
-# inject OPENSANDBOX_STORE_POSTGRESQL_DSN. Use only one active server replica.
+# inject OPENSANDBOX_STORE_POSTGRESQL_DSN. The deployment default is one Server
+# replica. An explicit two-replica topology supports multi-active public snapshots
+# only when PostgreSQL is paired with the Kubernetes runtime.
+# [store.postgresql]
+# snapshot_recovery_interval_seconds = 15
 
 [kubernetes]
 # Path to kubeconfig file. Leave as null to use in-cluster configuration
@@ -65,9 +69,7 @@ kubeconfig_path = "~/.kube/config"
 # Namespace for sandbox workloads
 namespace = "opensandbox"
 
-# [Beta] Enable informer-backed cache to reduce API calls.
-# Set to false to disable the watch-based cache.
-informer_enabled = true
+# [Beta] Informer cache resync and watch tuning.
 informer_resync_seconds = 300
 informer_watch_timeout_seconds = 60
 
@@ -78,10 +80,6 @@ workload_provider = "batchsandbox"
 # Image pull policy for the BatchSandbox main container.
 # Values: "Always", "IfNotPresent", "Never".
 image_pull_policy = "IfNotPresent"
-
-# Public snapshot wait timeout. Keep this greater than the Kubernetes
-# controller snapshot commit-job-timeout.
-snapshot_create_timeout_seconds = 900
 
 # Path to the BatchSandbox template file
 batchsandbox_template_file = "~/batchsandbox-template.yaml"
@@ -102,6 +100,14 @@ mode = "dns"
 # rule matches the configured host exactly, while the resolver expands partial
 # service names (e.g. otel-collector.observability) to FQDNs the rule misses.
 # otlp_endpoint = "http://otel-collector.observability.svc.cluster.local:4318"
+# Optional: chain sidecar egress through an upstream HTTP(S) CONNECT proxy. Requires mode = "dns+nft"
+# and transparent MITM per sandbox (credentialProxy.enabled or OPENSANDBOX_EGRESS_MITMPROXY_TRANSPARENT=true).
+# [egress.upstream_proxy]
+# url = "http://proxy.example.com:3128"
+# authorization = "Basic <base64>"
+# Optional: Secret holding an extra upstream CA bundle under the fixed key
+# "ca.crt"; mounted read-only into the egress sidecar only.
+# ca_secret_name = "corp-proxy-ca"
 
 # Renew-on-access. Off by default — see server/README.md.
 [renew_intent]

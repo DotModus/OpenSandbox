@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Alibaba Group Holding Ltd.
+ * Copyright 2025 The OpenSandbox Authors
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -398,8 +398,8 @@ internal object SandboxModelConverter {
     /**
      * API Endpoint -> Domain Endpoint
      */
-    fun Endpoint.toSandboxEndpoint(): SandboxEndpoint {
-        return SandboxEndpoint(this.endpoint, this.headers ?: emptyMap())
+    fun Endpoint.toSandboxEndpoint(origin: String? = null): SandboxEndpoint {
+        return SandboxEndpoint(this.endpoint, this.headers ?: emptyMap(), origin)
     }
 
     /**

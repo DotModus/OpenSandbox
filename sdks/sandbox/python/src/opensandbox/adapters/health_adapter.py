@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,7 +24,9 @@ import logging
 
 import httpx
 
+from opensandbox._httpx import build_async_redirect_client_options
 from opensandbox.config import ConnectionConfig
+from opensandbox.internal.readiness import is_readiness_auth_error
 from opensandbox.models.sandboxes import SandboxEndpoint
 from opensandbox.services.health import Health
 
@@ -65,6 +67,7 @@ class HealthAdapter(Health):
         self._client = Client(
             base_url=base_url,
             timeout=timeout,
+            follow_redirects=self.connection_config.follow_redirects,
         )
 
         self._httpx_client = httpx.AsyncClient(
@@ -72,6 +75,7 @@ class HealthAdapter(Health):
             headers=headers,
             timeout=timeout,
             transport=self.connection_config.transport,
+            **build_async_redirect_client_options(self.connection_config, base_url),
         )
         self._client.set_async_httpx_client(self._httpx_client)
 
@@ -101,5 +105,7 @@ class HealthAdapter(Health):
             return True
 
         except Exception as e:
+            if is_readiness_auth_error(e):
+                raise
             logger.debug(f"Health check failed for sandbox {sandbox_id}: {e}")
             return False

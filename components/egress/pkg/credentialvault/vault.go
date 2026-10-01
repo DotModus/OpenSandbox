@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@ package credentialvault
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,9 +27,10 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/alibaba/opensandbox/egress/pkg/constants"
 	"github.com/alibaba/opensandbox/egress/pkg/log"
@@ -64,15 +67,21 @@ var (
 	}
 )
 
+var activeSnapshotTagFallback atomic.Uint64
+
 type Store struct {
-	mu           sync.RWMutex
-	exists       bool
-	revision     int64
-	credentials  map[string]record
-	bindings     map[string]Binding
-	mitmGate     *mitmproxy.HealthGate
-	requireToken func() bool
-	sources      *SourceRegistry
+	mu             sync.RWMutex
+	exists         bool
+	revision       int64
+	credentials    map[string]record
+	bindings       map[string]Binding
+	activeTag      string
+	activeSnapshot *ActiveSnapshot
+	mutationTag    string
+	mitmGate       *mitmproxy.HealthGate
+	requireToken   func() bool
+	sources        *SourceRegistry
+	strictMatch    bool
 }
 
 type record struct {
@@ -214,9 +223,11 @@ func NewStoreWithRegistry(mitmGate *mitmproxy.HealthGate, requireToken func() bo
 	return &Store{
 		credentials:  make(map[string]record),
 		bindings:     make(map[string]Binding),
+		mutationTag:  newActiveSnapshotTag(),
 		mitmGate:     mitmGate,
 		requireToken: requireToken,
 		sources:      registry,
+		strictMatch:  constants.IsTruthy(os.Getenv(constants.EnvCredentialVaultRequireScopedMatch)),
 	}
 }
 
@@ -227,36 +238,11 @@ func (v *Store) Create(req CreateRequest, pol *policy.NetworkPolicy) (State, err
 		return State{}, ErrExists
 	}
 
-	credentials := make(map[string]record, len(req.Credentials))
-	bindings := make(map[string]Binding, len(req.Bindings))
-	for _, c := range req.Credentials {
-		rec, err := v.normalizeCredential(c, 1)
-		if err != nil {
-			return State{}, err
-		}
-		if _, ok := credentials[rec.Name]; ok {
-			return State{}, fmt.Errorf("duplicate credential name %q", rec.Name)
-		}
-		credentials[rec.Name] = rec
-	}
-	for _, b := range req.Bindings {
-		nb, err := normalizeBinding(b)
-		if err != nil {
-			return State{}, err
-		}
-		if _, ok := bindings[nb.Name]; ok {
-			return State{}, fmt.Errorf("duplicate binding name %q", nb.Name)
-		}
-		bindings[nb.Name] = nb
-	}
-	if err := v.validateCandidate(credentials, bindings, pol); err != nil {
+	credentials, bindings, err := v.buildCreate(req, pol)
+	if err != nil {
 		return State{}, err
 	}
-
-	v.exists = true
-	v.revision = 1
-	v.credentials = credentials
-	v.bindings = bindings
+	v.publishLocked(true, 1, credentials, bindings)
 	return v.sanitizedLocked(), nil
 }
 
@@ -271,22 +257,11 @@ func (v *Store) Patch(req MutationRequest, pol *policy.NetworkPolicy) (State, er
 	}
 
 	nextRevision := v.revision + 1
-	credentials := cloneCredentialRecords(v.credentials)
-	bindings := cloneCredentialBindings(v.bindings)
-
-	if err := v.applyCredentialMutations(credentials, req.Credentials, nextRevision); err != nil {
+	credentials, bindings, err := v.buildPatch(req, pol, nextRevision)
+	if err != nil {
 		return State{}, err
 	}
-	if err := applyBindingMutations(bindings, req.Bindings); err != nil {
-		return State{}, err
-	}
-	if err := v.validateCandidate(credentials, bindings, pol); err != nil {
-		return State{}, err
-	}
-
-	v.revision = nextRevision
-	v.credentials = credentials
-	v.bindings = bindings
+	v.publishLocked(true, nextRevision, credentials, bindings)
 	return v.sanitizedLocked(), nil
 }
 
@@ -296,10 +271,7 @@ func (v *Store) Delete() error {
 	if !v.exists {
 		return ErrNotFound
 	}
-	v.exists = false
-	v.revision = 0
-	v.credentials = make(map[string]record)
-	v.bindings = make(map[string]Binding)
+	v.publishLocked(false, 0, make(map[string]record), make(map[string]Binding))
 	return nil
 }
 
@@ -313,29 +285,7 @@ func (v *Store) Sanitized() (State, error) {
 }
 
 func (v *Store) sanitizedLocked() State {
-	state := State{
-		Revision:    v.revision,
-		Credentials: make([]Metadata, 0, len(v.credentials)),
-		Bindings:    make([]BindingMetadata, 0, len(v.bindings)),
-	}
-	for _, c := range v.credentials {
-		state.Credentials = append(state.Credentials, Metadata{
-			Name:       c.Name,
-			SourceType: c.SourceType,
-			Revision:   c.Revision,
-		})
-	}
-	for _, b := range v.bindings {
-		state.Bindings = append(state.Bindings, BindingMetadata{
-			Name:     b.Name,
-			Revision: v.revision,
-			Match:    b.Match,
-			Auth:     sanitizeAuth(b.Auth),
-		})
-	}
-	sort.Slice(state.Credentials, func(i, j int) bool { return state.Credentials[i].Name < state.Credentials[j].Name })
-	sort.Slice(state.Bindings, func(i, j int) bool { return state.Bindings[i].Name < state.Bindings[j].Name })
-	return state
+	return sanitizedState(v.revision, v.credentials, v.bindings)
 }
 
 func (v *Store) ActiveSnapshot() (ActiveSnapshot, error) {
@@ -343,54 +293,47 @@ func (v *Store) ActiveSnapshot() (ActiveSnapshot, error) {
 }
 
 func (v *Store) ActiveSnapshotWithContext(ctx context.Context) (ActiveSnapshot, error) {
+	snapshot, _, _, err := v.ActiveSnapshotIfChanged(ctx, "")
+	return snapshot, err
+}
+
+// ActiveSnapshotIfChanged atomically compares the caller's opaque snapshot tag
+// with the active vault and renders credentials only when the tag differs.
+// The comparison and rendering share one read lock so a mutation cannot make
+// the returned revision and snapshot disagree.
+func (v *Store) ActiveSnapshotIfChanged(
+	ctx context.Context,
+	knownTag string,
+) (ActiveSnapshot, string, bool, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	if !v.exists {
-		return ActiveSnapshot{}, ErrNotFound
+		return ActiveSnapshot{}, "", false, ErrNotFound
 	}
-	snapshot := ActiveSnapshot{
-		Revision: v.revision,
-		Bindings: make([]ActiveBinding, 0, len(v.bindings)),
+	if knownTag != "" && knownTag == v.activeTag {
+		return ActiveSnapshot{Revision: v.revision}, v.activeTag, false, nil
 	}
-	redactions := make(map[string]struct{})
-	names := make([]string, 0, len(v.bindings))
-	for name := range v.bindings {
-		names = append(names, name)
+	if v.activeSnapshot != nil {
+		return cloneActiveSnapshot(*v.activeSnapshot), v.activeTag, true, nil
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		b := v.bindings[name]
-		headers, values, err := renderInjectionHeaders(ctx, b.Auth, v.credentials)
-		if err != nil {
-			return ActiveSnapshot{}, err
-		}
-		substitutions, substitutionValues, err := renderSubstitutions(ctx, b.Auth, v.credentials)
-		if err != nil {
-			return ActiveSnapshot{}, err
-		}
-		snapshot.Bindings = append(snapshot.Bindings, ActiveBinding{
-			Name:          b.Name,
-			Match:         b.Match,
-			Headers:       headers,
-			Substitutions: substitutions,
-		})
-		values = append(values, substitutionValues...)
-		for _, value := range values {
-			if value != "" {
-				redactions[value] = struct{}{}
-			}
-		}
+	snapshot, err := renderActiveSnapshot(ctx, v.revision, v.credentials, v.bindings)
+	if err != nil {
+		return ActiveSnapshot{}, "", false, err
 	}
-	for value := range redactions {
-		snapshot.Redactions = append(snapshot.Redactions, value)
+	return snapshot, v.activeTag, true, nil
+}
+
+func newActiveSnapshotTag() string {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return hex.EncodeToString(value[:])
 	}
-	sort.Slice(snapshot.Redactions, func(i, j int) bool {
-		if len(snapshot.Redactions[i]) != len(snapshot.Redactions[j]) {
-			return len(snapshot.Redactions[i]) > len(snapshot.Redactions[j])
-		}
-		return snapshot.Redactions[i] < snapshot.Redactions[j]
-	})
-	return snapshot, nil
+	return fmt.Sprintf(
+		"fallback-%x-%x-%x",
+		os.Getpid(),
+		time.Now().UnixNano(),
+		activeSnapshotTagFallback.Add(1),
+	)
 }
 
 func (v *Store) ValidateActiveAgainstPolicy(pol *policy.NetworkPolicy) error {
@@ -459,7 +402,7 @@ func (v *Store) normalizeCredential(c Credential, revision int64) (record, error
 	if name == "" {
 		return record{}, fmt.Errorf("credential name cannot be blank")
 	}
-	source, err := v.sources.Create(c.Source)
+	source, err := v.sources.Create(append(json.RawMessage(nil), c.Source...))
 	if err != nil {
 		return record{}, fmt.Errorf("credential %q: %w", name, err)
 	}
@@ -467,6 +410,7 @@ func (v *Store) normalizeCredential(c Credential, revision int64) (record, error
 }
 
 func normalizeBinding(b Binding) (Binding, error) {
+	b = cloneBinding(b)
 	b.Name = strings.TrimSpace(b.Name)
 	if b.Name == "" {
 		return Binding{}, fmt.Errorf("binding name cannot be blank")
@@ -478,6 +422,29 @@ func normalizeBinding(b Binding) (Binding, error) {
 		return Binding{}, fmt.Errorf("binding %q: %w", b.Name, err)
 	}
 	return b, nil
+}
+
+func (v *Store) normalizeBinding(b Binding) (Binding, error) {
+	methodsExplicit := len(b.Match.Methods) > 0
+	pathsExplicit := len(b.Match.Paths) > 0
+	normalized, err := normalizeBinding(b)
+	if err != nil {
+		return Binding{}, err
+	}
+	if v.strictMatch {
+		if !methodsExplicit {
+			return Binding{}, fmt.Errorf("binding %q: match.methods must be explicit when scoped-match enforcement is enabled", normalized.Name)
+		}
+		if !pathsExplicit {
+			return Binding{}, fmt.Errorf("binding %q: match.paths must be explicit when scoped-match enforcement is enabled", normalized.Name)
+		}
+		for _, path := range normalized.Match.Paths {
+			if path == "/*" {
+				return Binding{}, fmt.Errorf("binding %q: match.paths must not contain /* when scoped-match enforcement is enabled", normalized.Name)
+			}
+		}
+	}
+	return normalized, nil
 }
 
 func normalizeMatch(m *Match) error {
@@ -887,7 +854,7 @@ func (v *Store) applyCredentialMutations(credentials map[string]record, mutation
 	return nil
 }
 
-func applyBindingMutations(bindings map[string]Binding, mutations *BindingMutationSet) error {
+func (v *Store) applyBindingMutations(bindings map[string]Binding, mutations *BindingMutationSet) error {
 	if mutations == nil {
 		return nil
 	}
@@ -907,7 +874,7 @@ func applyBindingMutations(bindings map[string]Binding, mutations *BindingMutati
 		delete(bindings, name)
 	}
 	for _, raw := range mutations.Replace {
-		b, err := normalizeBinding(raw)
+		b, err := v.normalizeBinding(raw)
 		if err != nil {
 			return err
 		}
@@ -922,7 +889,7 @@ func applyBindingMutations(bindings map[string]Binding, mutations *BindingMutati
 	}
 	addSeen := make(map[string]struct{})
 	for _, raw := range mutations.Add {
-		b, err := normalizeBinding(raw)
+		b, err := v.normalizeBinding(raw)
 		if err != nil {
 			return err
 		}
@@ -952,7 +919,7 @@ func cloneCredentialRecords(in map[string]record) map[string]record {
 func cloneCredentialBindings(in map[string]Binding) map[string]Binding {
 	out := make(map[string]Binding, len(in))
 	for k, v := range in {
-		out[k] = v
+		out[k] = cloneBinding(v)
 	}
 	return out
 }

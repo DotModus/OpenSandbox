@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -65,6 +65,26 @@ internal sealed class HttpClientWrapper
 
         using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
         return await HandleResponseAsync<T>(response, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Gets a JSON resource and also returns response headers, e.g. to read
+    /// metadata such as the OPEN-SANDBOX-ORIGIN header.
+    /// </summary>
+    public async Task<(T Body, IReadOnlyDictionary<string, string> Headers)> GetWithHeadersAsync<T>(
+        string path,
+        Dictionary<string, string?>? queryParams = null,
+        CancellationToken cancellationToken = default)
+    {
+        var url = BuildUrl(path, queryParams);
+        _logger.LogDebug("HTTP GET {Url}", url);
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        ApplyDefaultHeaders(request);
+
+        using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        var headers = response.Headers.ToDictionary(h => h.Key, h => h.Value.FirstOrDefault() ?? string.Empty, StringComparer.OrdinalIgnoreCase);
+        var body = await HandleResponseAsync<T>(response, cancellationToken).ConfigureAwait(false);
+        return (body, headers);
     }
 
     public async Task GetAsync(

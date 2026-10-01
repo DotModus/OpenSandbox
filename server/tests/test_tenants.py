@@ -1,4 +1,4 @@
-# Copyright 2026 Alibaba Group Holding Ltd.
+# Copyright 2026 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -193,7 +193,6 @@ def test_file_provider_hot_reload(tmp_path):
     provider.start()
     try:
         assert provider.lookup("key-new") is None
-        # Modify file
         time.sleep(0.05)
         f.write_text("""\
 [[tenants]]
@@ -217,7 +216,6 @@ def test_file_provider_reload_bad_file_keeps_previous(tmp_path):
     try:
         f.write_text("invalid toml [[[")
         provider._reload()
-        # Should keep previous state
         assert provider.lookup("key-alpha-1") is not None
     finally:
         provider.close()
@@ -271,7 +269,6 @@ def test_http_provider_lookup_cache_hit():
     provider = HTTPTenantProvider(cfg)
     provider.start()
     try:
-        # Manually inject a cache entry
         from opensandbox_server.tenants.http_provider import _CacheEntry
 
         entry = TenantEntry(name="cached", namespace="ns-cached", api_keys=("key-c",))

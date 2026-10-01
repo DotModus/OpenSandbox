@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@ import { FilesystemAdapter } from "../adapters/filesystemAdapter.js";
 import { HealthAdapter } from "../adapters/healthAdapter.js";
 import { IsolatedSessionsAdapter } from "../adapters/isolatedSessionsAdapter.js";
 import { MetricsAdapter } from "../adapters/metricsAdapter.js";
+import { NetworkPolicyAdapter } from "../adapters/networkPolicyAdapter.js";
 import { SandboxesAdapter } from "../adapters/sandboxesAdapter.js";
 
 import type {
@@ -29,6 +30,7 @@ import type {
   CreateEgressStackOptions,
   CreateExecdStackOptions,
   CreateLifecycleStackOptions,
+  CreateNetworkPolicyStackOptions,
   EgressStack,
   ExecdStack,
   LifecycleStack,
@@ -147,6 +149,18 @@ export class DefaultAdapterFactory implements AdapterFactory {
     return {
       egress,
       credentialVault: egress,
+    };
+  }
+
+  createNetworkPolicyStack(opts: CreateNetworkPolicyStackOptions): EgressStack {
+    const lifecycleClient = createLifecycleClient({
+      baseUrl: opts.lifecycleBaseUrl,
+      apiKey: opts.connectionConfig.apiKey,
+      headers: opts.connectionConfig.headers,
+      fetch: opts.connectionConfig.fetch,
+    });
+    return {
+      egress: new NetworkPolicyAdapter(lifecycleClient, opts.sandboxId),
     };
   }
 }

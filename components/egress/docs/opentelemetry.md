@@ -14,7 +14,7 @@ This page lists the OpenTelemetry metrics currently implemented in egress.
 | `egress.dns.query.failed_total` | Counter | - | Queries the proxy could not resolve, by `reason`. |
 | `egress.dns.reply.failed_total` | Counter | - | Reply writes that failed after a decision, by `stage`. A nonzero count means a query was handled but its answer never reached the client. |
 | `egress.policy.denied_total` | Counter | - | Number of DNS queries denied by policy. |
-| `egress.nftables.rules.count` | Observable Gauge | `{element}` | Approximate policy size after last successful static apply (fleet profile: summed across every installed subject's policy, 0 while deny-first). |
+| `egress.nftables.rules.count` | Observable Gauge | `{element}` | Approximate policy size after last successful static apply (fast-sandbox profile: summed across every installed subject's policy, 0 while deny-first). |
 | `egress.nftables.updates.count` | Counter | - | Number of successful nftables updates (static apply + dynamic IP add). |
 | `egress.nftables.updates.failed_total` | Counter | - | nftables updates that failed, by `operation`. |
 | `egress.system.memory.usage_bytes` | Observable Gauge | `By` | **Node** memory used bytes (Linux: gopsutil; non-Linux build: `0`). |
@@ -55,10 +55,10 @@ the spec's millisecond ladder (`0, 5, 10, … 10000`), so every realistic latenc
 into the single `le=5` bucket and the quantiles would be meaningless.
 
 The head resolves a cache hit (sub-millisecond) up to one upstream timeout
-(`OPENSANDBOX_EGRESS_DNS_UPSTREAM_TIMEOUT`, 5s by default). The coarse tail exists because
+(`OPENSANDBOX_EGRESS_DNS_UPSTREAM_TIMEOUT`, 2s by default). The coarse tail exists because
 the recorded duration covers the **whole resolver chain**: forwarding walks the upstreams
 serially, each with the full timeout, so a query can legitimately take
-`timeout x len(upstreams)` — 15s is three resolvers at the default, and 120s is the cap a
+`timeout x len(upstreams)` — 6s is three resolvers at the default, and 120s is the cap a
 single exchange can be configured to wait. A late **success** lands in the tail too, not only an exhausted failure: a query can
 succeed on the second resolver after the first burned a full timeout. The chain has no finite
 worst case either (`OPENSANDBOX_EGRESS_DNS_UPSTREAM` accepts an unbounded resolver list), so
@@ -68,6 +68,13 @@ per-exchange cap — has bigger problems than a percentile.
 
 Note both successful and failed lookups feed this histogram, so its tail mixes slow
 resolutions with exhausted retry chains.
+
+## TLS shadow implementation
+
+The system addon emits fixed outcomes through the existing child stdout pipe;
+the Go relay consumes them via `RecordTLSShadow` as bounded-label OTLP samples.
+Unknown outcomes are discarded. The operator contract is maintained in
+[Egress: TLS shadow observations](../../../docs/components/egress.md#experimental-tls-shadow-observations).
 
 ## Failure Signals
 
@@ -90,7 +97,7 @@ queried name nor the error text is ever attached:
 | `rcode` | The last resolver answered with a failover-worthy rcode, e.g. `SERVFAIL`. |
 
 `egress.nftables.updates.failed_total` covers the other silent failure. Its `operation`
-attribute is one of `static_apply`, `dynamic_add`, `remove`, or — in the fleet profile
+attribute is one of `static_apply`, `dynamic_add`, `remove`, or — in the fast-sandbox profile
 (OSEP-0022) — `deny_first`, `reset`; `dynamic_add` is the one to
 alert on, because a failed add means the kernel never learned about IPs the policy allows,
 so the chain drops traffic that should pass — which looks exactly like a policy denial from
@@ -99,7 +106,7 @@ inside the sandbox while `egress.policy.denied_total` stays flat.
 `egress.dns.reply.failed_total` covers the last silent failure class: a query that was
 **handled** (decided, maybe forwarded and answered upstream) whose reply write then failed.
 Until the write error was surfaced, such windows were indistinguishable from "query never
-handled" — the fleet-profile case where guest-originated DNS is answered in the proxy but
+handled" — the fast-sandbox-profile case where guest-originated DNS is answered in the proxy but
 the reply never reaches the sandbox (issue #1704). Its `stage` attribute is one of
 `malformed`, `unknown_source`, `deny`, `upstream_error`, `answer`, and every failure also
 emits a `[dns] reply write failed (stage=… remote=… question=…)` warning with the remote

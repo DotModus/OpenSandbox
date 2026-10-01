@@ -1,5 +1,5 @@
 #
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -508,6 +508,24 @@ def test_execution_converter_to_api_run_command_request() -> None:
     assert d4["gid"] == 1000
     assert d4["envs"] == {"APP_ENV": "test", "LOG_LEVEL": "debug"}
     assert "cwd" not in d4
+
+
+    argv = ["tool", "", "a b", "$HOME", "x'y", "中文"]
+    native = ExecutionConverter.to_api_run_command_request(
+        argv, RunCommandOpts(background=True, working_directory="$DIR", envs={"DIR": "/tmp"})
+    ).to_dict()
+    assert native == {"argv": argv, "background": True, "cwd": "$DIR", "envs": {"DIR": "/tmp"}}
+    for invalid in ([], [""], ["tool", "\0"], ["tool", None], ("tool", "arg"), None, 123):
+        with pytest.raises(InvalidArgumentException):
+            ExecutionConverter.to_api_run_command_request(invalid, RunCommandOpts())
+
+    # Shell-sensitive values (a literal "$HOME", an embedded space, a single
+    # quote, a trailing empty string) travel in `argv` untouched.
+    literal_argv = ["python3", "-c", "import sys; print(sys.argv[1:])", "a b", "$HOME", "x'y", ""]
+    literal_request = ExecutionConverter.to_api_run_command_request(
+        literal_argv, RunCommandOpts()
+    ).to_dict()
+    assert literal_request == {"argv": literal_argv}
 
 
 def test_run_command_opts_validates_gid_requires_uid() -> None:

@@ -1,4 +1,4 @@
-// Copyright 2025 Alibaba Group Holding Ltd.
+// Copyright 2025 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -183,7 +183,6 @@ func (c *FilesystemController) serveLineRange(file *os.File, rawOffset, rawLimit
 // formatContentDisposition formats the Content-Disposition header value with proper
 // encoding for non-ASCII filenames according to RFC 6266 and RFC 5987.
 func formatContentDisposition(filename string) string {
-	// Check if filename contains non-ASCII characters
 	needsEncoding := false
 	for _, r := range filename {
 		if r > 127 {
@@ -196,8 +195,6 @@ func formatContentDisposition(filename string) string {
 		return "attachment; filename=\"" + filename + "\""
 	}
 
-	// Use RFC 5987 encoding for non-ASCII filenames
-	// Format: attachment; filename="fallback"; filename*=UTF-8''encoded_name
 	encodedFilename := url.PathEscape(filename)
 	return "attachment; filename=\"" + encodedFilename + "\"; filename*=UTF-8''" + encodedFilename
 }

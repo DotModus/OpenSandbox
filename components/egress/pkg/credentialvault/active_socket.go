@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,10 +35,9 @@ func StartActiveSocketServer(
 	return startActiveSocketServer(func(w http.ResponseWriter, _ *http.Request) { activeHandler(w) }, socketPath, socketGID)
 }
 
-// StartActiveSocketServerRequestAware is the fleet-profile variant: the
-// handler receives the request so it can dispatch on clientIp (source IP ->
-// subject -> that subject's vault snapshot). The sidecar handler stays
-// request-unaware and is unchanged.
+// StartActiveSocketServerRequestAware passes the request to active-vault
+// handlers. Sidecar handlers inspect conditional snapshot headers; fast-sandbox
+// handlers additionally dispatch clientIp (source IP -> subject -> snapshot).
 func StartActiveSocketServerRequestAware(
 	activeHandler func(http.ResponseWriter, *http.Request),
 	socketPath string,

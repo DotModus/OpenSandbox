@@ -1,4 +1,4 @@
-# Copyright 2025 Alibaba Group Holding Ltd.
+# Copyright 2025 The OpenSandbox Authors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,23 +42,34 @@ class WorkloadInformer:
         watch_timeout_seconds: int = 60,
         enable_watch: bool = True,
         thread_name: str = "workload-informer",
+        event_handler: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ):
         """
         Args:
             list_fn: Callable that lists the custom resource, with signature
                      ``list_fn(**kwargs) -> dict``.  Typically a bound method
                      like ``custom_api.list_namespaced_custom_object``.
-            resync_period_seconds: Full-resync interval for the cache.
-            watch_timeout_seconds: Per-stream watch timeout before restart.
+            resync_period_seconds: int: Full-resync interval for the cache.
+            watch_timeout_seconds: int: Per-stream watch timeout before restart.
             enable_watch: When False only the initial list is performed.
-            thread_name: Name for the background thread, used in stack traces
-                         and debuggers.  Should be unique per informer instance.
+            thread_name: str: Name for the background thread, used in stack traces
+                     and debuggers.  Should be unique per informer instance.
+            event_handler: Optional reactor callback ``handler(event_type, object)``
+                     invoked outside the cache lock for every watch event
+                     (``ADDED``/``MODIFIED``/``DELETED``) and for every item of
+                     an initial/reconciling LIST snapshot (``SYNC``). Handler
+                     errors are logged and never kill the watch thread.
         """
         self.list_fn = list_fn
         self.resync_period_seconds = resync_period_seconds
         self.watch_timeout_seconds = watch_timeout_seconds
         self.enable_watch = enable_watch
         self._thread_name = thread_name
+        self._event_handlers: List[Callable[[str, Dict[str, Any]], None]] = (
+            [event_handler] if event_handler is not None else []
+        )
+
+        self._subscribers: Dict[str, List[Callable[[str, Dict[str, Any]], None]]] = {}
 
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
@@ -75,7 +86,6 @@ class WorkloadInformer:
         return self.resync_period_seconds + self.watch_timeout_seconds
 
     def start(self) -> None:
-        """Start the background watch thread if not already running."""
         if self._stop_event.is_set():
             return
         if self._thread and self._thread.is_alive():
@@ -89,7 +99,6 @@ class WorkloadInformer:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop the background watch thread."""
         self._stop_event.set()
 
     def get_if_synced(self, name: str) -> Optional[Dict[str, Any]]:
@@ -113,6 +122,43 @@ class WorkloadInformer:
         if self._last_contact_at is None:
             return False
         return time.monotonic() - self._last_contact_at <= self._staleness_limit_seconds
+
+    def add_event_handler(self, event_handler: Optional[Callable[[str, Dict[str, Any]], None]]) -> None:
+        """Attach an additional reactor callback to a (possibly running) informer.
+
+        Informers are created lazily by the first read path, which passes no
+        handler; watch consumers that attach later register through this method
+        so their handler is invoked for every subsequent event and resync.
+        """
+        if event_handler is None:
+            return
+        with self._lock:
+            if event_handler not in self._event_handlers:
+                self._event_handlers.append(event_handler)
+
+    def subscribe(self, names: List[str], callback: Callable[[str, Dict[str, Any]], None]) -> Callable[[], None]:
+        """Subscribe to named resource changes; return an idempotent unsubscribe."""
+        names = list(dict.fromkeys(names))
+        with self._lock:
+            for name in names:
+                self._subscribers.setdefault(name, []).append(callback)
+
+        subscribed = True
+
+        def unsubscribe() -> None:
+            nonlocal subscribed
+            with self._lock:
+                if not subscribed:
+                    return
+                subscribed = False
+                for name in names:
+                    callbacks = self._subscribers.get(name, [])
+                    if callback in callbacks:
+                        callbacks.remove(callback)
+                    if not callbacks:
+                        self._subscribers.pop(name, None)
+
+        return unsubscribe
 
     def invalidate(self) -> None:
         """Make the published cache unavailable after a successful direct mutation.
@@ -207,10 +253,15 @@ class WorkloadInformer:
             self._resource_version = resource_version
             self._has_synced = True
             self._last_contact_at = time.monotonic()
-            return True
+
+        # React to the snapshot outside the lock: a LIST reconciles objects
+        # that changed while no watch was connected (startup, reconnect).
+        if self._event_handlers or self._subscribers:
+            for item in new_cache.values():
+                self._dispatch_event("SYNC", item)
+        return True
 
     def _run_watch_loop(self, timeout_seconds: int) -> None:
-        """Stream watch events to keep the cache fresh."""
         w = watch.Watch()
         try:
             for event in w.stream(
@@ -266,3 +317,24 @@ class WorkloadInformer:
                 # The cache update is retained internally, but cannot be
                 # published until a LIST supplies a trustworthy cursor again.
                 self._has_synced = False
+
+        # Dispatch the reactor outside the cache lock so handlers can read
+        # the cache (or do slow work) without deadlocking the watch thread.
+        self._dispatch_event(event_type, obj)
+
+    def _dispatch_event(self, event_type: Optional[str], obj: Dict[str, Any]) -> None:
+        """Invoke the reactor callbacks; handler failures never kill the watch."""
+        with self._lock:
+            handlers = tuple(self._event_handlers)
+            callbacks = tuple(self._subscribers.get(obj.get("metadata", {}).get("name"), ()))
+        for handler in handlers:
+            try:
+                handler(event_type or "", obj)
+            except Exception as exc:  # noqa: BLE001 - isolation by design
+                logger.warning(f"Informer event handler failed: {exc}", exc_info=True)
+
+        for callback in callbacks:
+            try:
+                callback(event_type or "", obj)
+            except Exception as exc:  # noqa: BLE001 - isolation by design
+                logger.warning(f"Informer subscriber failed: {exc}", exc_info=True)

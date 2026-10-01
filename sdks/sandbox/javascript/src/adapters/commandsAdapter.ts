@@ -1,4 +1,4 @@
-// Copyright 2026 Alibaba Group Holding Ltd.
+// Copyright 2026 The OpenSandbox Authors
 // 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,13 +51,13 @@ interface StreamingExecutionSpec<TBody> {
   fallbackErrorMessage: string;
 }
 
-function toRunCommandRequest(command: string, opts?: RunCommandOpts): ApiRunCommandRequest {
+function toRunCommandRequest(command: string | string[], opts?: RunCommandOpts): ApiRunCommandRequest {
   if (opts?.gid != null && opts.uid == null) {
     throw new Error("uid is required when gid is provided");
   }
 
   const body: ApiRunCommandRequest = {
-    command,
+    ...(typeof command === "string" ? { command } : { argv: command }),
     cwd: opts?.workingDirectory,
     background: !!opts?.background,
   };
@@ -109,6 +109,47 @@ function assertNonBlank(value: string, field: string): void {
   }
 }
 
+const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/** Quotes a string as a single POSIX shell word. */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** Escapes a value for the runtime env file's double-quoted form. */
+function escapeDoubleQuoted(value: string): string {
+  return value
+    .replaceAll("\\", "\\\\")
+    .replaceAll('"', '\\"')
+    .replaceAll("\n", "\\n")
+    .replaceAll("\r", "\\r")
+    .replaceAll("\t", "\\t");
+}
+
+/**
+ * Builds the sandbox-side snippet that appends KEY=VALUE to the env file named
+ * by the sandbox's EXECD_ENVS variable. Values without a single quote use the
+ * runtime env file's lossless single-quoted form; otherwise the double-quoted
+ * form is used (shell-style `$NAME` sequences in such values may be expanded
+ * when the runtime loads the file).
+ */
+function buildSetEnvCommand(key: string, value: string): string {
+  if (!ENV_KEY_PATTERN.test(key)) {
+    throw new Error(`setEnv key must match ${ENV_KEY_PATTERN.source}, got '${key}'`);
+  }
+  if (value.includes("\0")) {
+    throw new Error("setEnv value cannot contain NUL bytes");
+  }
+  const entry = value.includes("'")
+    ? `${key}="${escapeDoubleQuoted(value)}"`
+    : `${key}='${value}'`;
+  return [
+    `if [ -z "\${EXECD_ENVS:-}" ]; then printf '%s\\n' 'EXECD_ENVS is not set; cannot persist environment variable ${key}' >&2; exit 1; fi`,
+    `mkdir -p "$(dirname "$EXECD_ENVS")"`,
+    `printf '%s\\n' ${shellQuote(entry)} >> "$EXECD_ENVS"`,
+  ].join("\n");
+}
+
 function parseOptionalDate(value: unknown, field: string): Date | undefined {
   if (value == null) return undefined;
   if (value instanceof Date) return value;
@@ -142,10 +183,21 @@ export class CommandsAdapter implements ExecdCommands {
   }
 
   private buildRunStreamSpec(
-    command: string,
+    command: string | string[],
     opts?: RunCommandOpts,
   ): StreamingExecutionSpec<ApiRunCommandRequest> {
-    assertNonBlank(command, "command");
+    if (typeof command === "string") {
+      assertNonBlank(command, "command");
+    } else {
+      if (!Array.isArray(command) || !command.length || !command[0]) {
+        throw new Error("argv requires a non-empty executable and strings without NUL");
+      }
+      for (const arg of command) {
+        if (typeof arg !== "string" || arg.includes("\0")) {
+          throw new Error("argv requires a non-empty executable and strings without NUL");
+        }
+      }
+    }
     return {
       pathname: "/command",
       body: toRunCommandRequest(command, opts),
@@ -208,8 +260,8 @@ export class CommandsAdapter implements ExecdCommands {
       await dispatcher.dispatch(ev as any);
       if (isBackground && ev.type === "execution_complete") {
         // Background commands are done once execution_complete arrives; do
-        // not wait for the chunked terminator, which execd sends only after
-        // a graceful-shutdown sleep and can be lost if the connection is
+        // not wait for the chunked terminator, which older execd versions
+        // delay with a grace-period sleep and can be lost if the connection is
         // closed early (#1528).
         break;
       }
@@ -220,6 +272,16 @@ export class CommandsAdapter implements ExecdCommands {
     }
 
     return execution;
+  }
+
+  async setEnv(key: string, value: string): Promise<void> {
+    const command = buildSetEnvCommand(key, value);
+    const execution = await this.run(command);
+    if (execution.error != null || execution.exitCode !== 0) {
+      const stderr = execution.logs.stderr.map((m) => m.text).join("").trim();
+      const detail = stderr.length > 0 ? stderr : (execution.error?.value?.trim() ?? "");
+      throw new Error(`commands.setEnv failed for '${key}'${detail ? `: ${detail}` : ""}`);
+    }
   }
 
   async interrupt(sessionId: string): Promise<void> {
@@ -250,6 +312,10 @@ export class CommandsAdapter implements ExecdCommands {
   }
 
   async getBackgroundCommandLogs(commandId: string, cursor?: number): Promise<CommandLogs> {
+    if (cursor != null && cursor < 0) {
+      throw new Error("cursor cannot be negative");
+    }
+
     const { data, error, response } = await this.client.GET("/command/{id}/logs", {
       params: { path: { id: commandId }, query: cursor == null ? {} : { cursor } },
       parseAs: "text",
@@ -274,7 +340,7 @@ export class CommandsAdapter implements ExecdCommands {
   }
 
   async *runStream(
-    command: string,
+    command: string | string[],
     opts?: RunCommandOpts,
     signal?: AbortSignal,
   ): AsyncIterable<ServerStreamEvent> {
@@ -287,7 +353,7 @@ export class CommandsAdapter implements ExecdCommands {
   }
 
   async run(
-    command: string,
+    command: string | string[],
     opts?: RunCommandOpts,
     handlers?: ExecutionHandlers,
     signal?: AbortSignal,
