@@ -1,18 +1,22 @@
 # Patch branch
 
-Base: upstream commit `1ea4e385` on `main`, **not** a release tag.
+Base: upstream tag `release-1.1.1-rc.1` (commit `e5f9102f`), the umbrella
+release candidate for the 1.1 line.
 
-This branch previously sat on `k8s/image-committer/v0.1.1`. It was re-cut
-because the committer was rewritten upstream after that tag: it no longer
-shells out to `nerdctl` for the rootfs commit path, and `4eed1897`
-("recover missing snapshot image content") fixes a real failure where a node
-holds a container's unpacked snapshot but not the packed content of its
-base image, so the push cannot assemble a manifest. That fix cannot be taken
-on its own — the package it lives in did not exist at the old tag.
+This branch replaces the previous patch branch, which sat on upstream commit
+`1ea4e385` on `main` because no release then contained the committer
+rewrite and the `4eed1897` base-content re-fetch fix. Both are in the 1.1
+line, so the patches are re-cut onto a release tag as that branch intended.
+The previous branch is kept unchanged so that images built from it stay
+reproducible.
 
-`1ea4e385` is the newest upstream commit that touches this component. Later
-commits on `main` do not, so taking more would add churn without adding fix.
-There is no release containing this yet; re-cut onto the tag when one ships.
+Between `1ea4e385` and this tag the image-committer changed only in license
+headers, removal of a dead legacy result writer, and a QEMU-path pause flag.
+Its command-line arguments, environment (`CONTAINERD_SOCKET`,
+`SNAPSHOT_REGISTRY_INSECURE`, `SOURCE_POD_UID`,
+`SOURCE_IMAGE_REGISTRY_INSECURE`), registry-credential mount and termination
+message are unchanged, so the controller at this tag and the committer built
+from this branch speak the same contract.
 
 ## Patches carried here
 
@@ -29,6 +33,9 @@ There is no release containing this yet; re-cut onto the tag when one ships.
    Kept in `pkg/imagecommitter/cli/skip.go` rather than inlined, so upstream
    changes to `cli.go` do not conflict with it on the next re-cut.
 
+   Upstream at this tag still commits every container, sidecar included, so
+   the patch is still needed.
+
 2. **`GOPROXY` is an `ARG`.** The hard-coded value is unreachable outside
    China — the TLS handshake fails — so the image cannot be built elsewhere
    at all. The upstream value stays the default, so the upstream build is
@@ -36,6 +43,12 @@ There is no release containing this yet; re-cut onto the tag when one ships.
 
 Drop patch 1 when upstream stops committing containers a snapshot cannot
 restore from. Drop patch 2 when the proxy is configurable upstream.
+
+Known caveat: with a container skipped, the controller's own `spec.pause`
+resume cannot rebuild the skipped container from the snapshot. At this tag
+it fails safely with a `ResumeFailed` condition instead of an image pull
+back-off. Snapshot restore through the lifecycle server selects `sandbox`
+only and is unaffected.
 
 ## Rules for this branch
 
