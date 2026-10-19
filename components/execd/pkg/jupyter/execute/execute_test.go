@@ -288,16 +288,18 @@ func TestExecuteCodeStreamFallsBackWhenPollIntervalIsNonPositive(t *testing.T) {
 // kernel broadcast shutdown_reply and an idle status, and then it is killed: it never sends the
 // cell's execute_reply, and Jupyter Server keeps the websocket open. A kernel that dies on its
 // own is reported by the server as status restarting or dead, again with no reply. In every case
-// the stream must end with an error instead of waiting for a reply that will never come.
+// the stream must end with an error instead of waiting for a reply that will never come. A kernel
+// that replied and then died before its idle status must still end the stream, without an error.
 func TestExecuteCodeStreamEndsWhenKernelStopsMidExecution(t *testing.T) {
 	shutdownRequest := Header{MessageID: "shutdown-request-id", MessageType: "shutdown_request"}
 	cases := []struct {
 		name     string
-		messages func(session string) []Message
+		messages func(session string, executeRequest Header) []Message
+		replied  bool
 	}{
 		{
 			name: "context deleted (shutdown_reply)",
-			messages: func(session string) []Message {
+			messages: func(session string, _ Header) []Message {
 				reply, _ := json.Marshal(map[string]interface{}{"status": "ok", "restart": false})
 				idle, _ := json.Marshal(StatusUpdate{ExecutionState: StateIdle})
 				return []Message{
@@ -308,17 +310,29 @@ func TestExecuteCodeStreamEndsWhenKernelStopsMidExecution(t *testing.T) {
 		},
 		{
 			name: "kernel died and is restarting",
-			messages: func(session string) []Message {
+			messages: func(session string, _ Header) []Message {
 				restarting, _ := json.Marshal(StatusUpdate{ExecutionState: StateRestarting})
 				return []Message{{Header: Header{MessageID: "restarting-id", Session: session, MessageType: string(MsgStatus)}, Content: restarting, Channel: "iopub"}}
 			},
 		},
 		{
 			name: "kernel died and could not restart",
-			messages: func(session string) []Message {
+			messages: func(session string, _ Header) []Message {
 				dead, _ := json.Marshal(StatusUpdate{ExecutionState: StateDead})
 				return []Message{{Header: Header{MessageID: "dead-id", Session: session, MessageType: string(MsgStatus)}, Content: dead, Channel: "iopub"}}
 			},
+		},
+		{
+			name: "kernel replied, then died before its idle status",
+			messages: func(session string, executeRequest Header) []Message {
+				reply, _ := json.Marshal(ExecuteReply{ExecutionCount: 1})
+				restarting, _ := json.Marshal(StatusUpdate{ExecutionState: StateRestarting})
+				return []Message{
+					{Header: Header{MessageID: "execute-reply-id", Session: session, MessageType: string(MsgExecuteReply)}, ParentHeader: executeRequest, Content: reply, Channel: "shell"},
+					{Header: Header{MessageID: "restarting-id", Session: session, MessageType: string(MsgStatus)}, Content: restarting, Channel: "iopub"},
+				}
+			},
+			replied: true,
 		},
 	}
 
@@ -337,7 +351,7 @@ func TestExecuteCodeStreamEndsWhenKernelStopsMidExecution(t *testing.T) {
 					ParentHeader: executeRequest.Header,
 					Content:      busy,
 				}))
-				for _, msg := range tc.messages(executeRequest.Header.Session) {
+				for _, msg := range tc.messages(executeRequest.Header.Session, executeRequest.Header) {
 					require.NoError(t, conn.WriteJSON(msg))
 				}
 				// Jupyter Server leaves the websocket open after the kernel is gone.
@@ -360,6 +374,10 @@ func TestExecuteCodeStreamEndsWhenKernelStopsMidExecution(t *testing.T) {
 				select {
 				case result, open := <-resultChan:
 					if !open {
+						if tc.replied {
+							require.Nil(t, stopped, "a run that already replied must not get a KernelStopped error")
+							return
+						}
 						require.NotNil(t, stopped, "expected an error result before the stream closed")
 						require.Equal(t, "KernelStopped", stopped.EName)
 						return

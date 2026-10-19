@@ -325,27 +325,27 @@ func (c *Client) handleExecutionStatus(msg *Message, state *streamExecutionState
 	safego.Go(func() { c.finalizeExecution(state, resultChan) })
 }
 
-// handleKernelStopped ends the execution in flight when its kernel goes away before replying:
-// its context was deleted (shutdown_reply), or it died (status restarting or dead). Such a kernel
-// never sends this execution's execute_reply, and Jupyter Server keeps the websocket open, so
-// without this finalizeExecution would wait for the reply forever and the run would never end.
+// handleKernelStopped ends the execution in flight when its kernel goes away: its context was
+// deleted (shutdown_reply), or it died (status restarting or dead). Such a kernel sends neither
+// this execution's execute_reply (if it has not yet) nor its idle status, and Jupyter Server keeps
+// the websocket open, so without this the run would never end. A run that already replied gets no
+// KernelStopped error, but is still finalized, since the idle status that would do it never comes.
 func (c *Client) handleKernelStopped(state *streamExecutionState, resultChan chan *ExecutionResult, reason string) {
 	state.resultMutex.Lock()
 	replied := state.result.ExecutionCount > 0 || state.result.Error != nil
 	state.resultMutex.Unlock()
-	if replied {
-		return
+
+	if !replied {
+		// As in handleExecutionError: send before recording the error, so a finalizeExecution
+		// already polling cannot close resultChan before the error reaches the client.
+		errOutput := &ErrorOutput{EName: "KernelStopped", EValue: reason}
+		state.trySend(resultChan, &ExecutionResult{Error: errOutput, Status: "error"})
+
+		state.resultMutex.Lock()
+		state.result.Status = "error"
+		state.result.Error = errOutput
+		state.resultMutex.Unlock()
 	}
-
-	// As in handleExecutionError: send before recording the error, so a finalizeExecution already
-	// polling cannot close resultChan before the error reaches the client.
-	errOutput := &ErrorOutput{EName: "KernelStopped", EValue: reason}
-	state.trySend(resultChan, &ExecutionResult{Error: errOutput, Status: "error"})
-
-	state.resultMutex.Lock()
-	state.result.Status = "error"
-	state.result.Error = errOutput
-	state.resultMutex.Unlock()
 
 	state.executeMutex.Lock()
 	defer state.executeMutex.Unlock()
