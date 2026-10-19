@@ -62,6 +62,8 @@ Sessions use Bash when the image provides it and fall back to POSIX `sh` on mini
 
 Code contexts are persistent Jupyter kernels managed by execd. You execute code in a context and receive streamed results — standard output, execution results, and errors — across multiple calls that share state, exactly like a notebook.
 
+If a context's kernel stops while code is still running in it, the run ends with an `error` event whose `ename` is `KernelStopped` rather than staying open. This covers a context deleted mid-run, which also stops code that ignores interrupts, and a kernel that dies on its own. The kernel's in-memory state is gone; files it wrote stay.
+
 The official [code-interpreter image](https://github.com/opensandbox-group/sandbox-images) ships Python, Java, Node.js, and Go runtimes with matching Jupyter kernels — see the [Code Interpreter example](/examples/code-interpreter). Code execution is available through the plain sandbox SDKs and the raw API.
 
 ## Interactive terminals

@@ -54,6 +54,8 @@ const (
 	MsgKernelInfoReply MessageType = "kernel_info_reply"
 
 	MsgExecuteReply MessageType = "execute_reply"
+
+	MsgShutdownReply MessageType = "shutdown_reply"
 )
 
 type StreamType string
@@ -72,6 +74,10 @@ const (
 	StateBusy ExecutionState = "busy"
 
 	StateStarting ExecutionState = "starting"
+
+	StateRestarting ExecutionState = "restarting"
+
+	StateDead ExecutionState = "dead"
 )
 
 type Header struct {

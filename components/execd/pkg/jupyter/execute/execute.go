@@ -220,6 +220,9 @@ func (c *Client) registerExecuteCodeStreamHandlers(state *streamExecutionState, 
 	c.registerHandler(MsgStatus, func(msg *Message) {
 		c.handleExecutionStatus(msg, state, resultChan)
 	})
+	c.registerHandler(MsgShutdownReply, func(_ *Message) {
+		c.handleKernelStopped(state, resultChan, "the kernel shut down before the execution finished")
+	})
 }
 
 func (c *Client) handleExecuteReply(msg *Message, state *streamExecutionState) {
@@ -301,9 +304,48 @@ func (c *Client) handleExecutionStatus(msg *Message, state *streamExecutionState
 	if err := json.Unmarshal(msg.Content, &status); err != nil {
 		return
 	}
-	if status.ExecutionState != StateIdle {
+	switch status.ExecutionState {
+	case StateRestarting:
+		c.handleKernelStopped(state, resultChan, "the kernel died and is restarting before the execution finished")
+		return
+	case StateDead:
+		c.handleKernelStopped(state, resultChan, "the kernel died before the execution finished")
+		return
+	case StateIdle:
+	default:
 		return
 	}
+
+	state.executeMutex.Lock()
+	defer state.executeMutex.Unlock()
+	if state.executeDone {
+		return
+	}
+	state.executeDone = true
+	safego.Go(func() { c.finalizeExecution(state, resultChan) })
+}
+
+// handleKernelStopped ends the execution in flight when its kernel goes away before replying:
+// its context was deleted (shutdown_reply), or it died (status restarting or dead). Such a kernel
+// never sends this execution's execute_reply, and Jupyter Server keeps the websocket open, so
+// without this finalizeExecution would wait for the reply forever and the run would never end.
+func (c *Client) handleKernelStopped(state *streamExecutionState, resultChan chan *ExecutionResult, reason string) {
+	state.resultMutex.Lock()
+	replied := state.result.ExecutionCount > 0 || state.result.Error != nil
+	state.resultMutex.Unlock()
+	if replied {
+		return
+	}
+
+	// As in handleExecutionError: send before recording the error, so a finalizeExecution already
+	// polling cannot close resultChan before the error reaches the client.
+	errOutput := &ErrorOutput{EName: "KernelStopped", EValue: reason}
+	state.trySend(resultChan, &ExecutionResult{Error: errOutput, Status: "error"})
+
+	state.resultMutex.Lock()
+	state.result.Status = "error"
+	state.result.Error = errOutput
+	state.resultMutex.Unlock()
 
 	state.executeMutex.Lock()
 	defer state.executeMutex.Unlock()
