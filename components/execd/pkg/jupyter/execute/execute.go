@@ -104,6 +104,12 @@ type streamExecutionState struct {
 	executeMutex sync.Mutex
 	resultMutex  sync.Mutex
 
+	// msgID is the msg_id of this run's execute_request. The kernel sets it as the parent of every
+	// message that answers the request. The run's connection also carries messages for other
+	// requests: the busy and idle statuses for Jupyter Server's kernel_info_request on connect, and
+	// the output of an earlier run that is still going. Those are not this run's.
+	msgID string
+
 	// chanMutex guards resultChan's close-vs-send race. state.result.ExecutionCount/Error can be
 	// set by handleExecuteReply with no corresponding resultChan send at all (e.g. plain print()
 	// cells never emit execute_result), so finalizeExecution's poll loop can observe "done" and
@@ -125,6 +131,11 @@ func newStreamExecutionState(startTime time.Time) *streamExecutionState {
 			ExecutionTime: 0,
 		},
 	}
+}
+
+// owns reports whether msg answers this run's request.
+func (state *streamExecutionState) owns(msg *Message) bool {
+	return msg.ParentHeader.MessageID == state.msgID
 }
 
 // trySend delivers notify on resultChan unless the channel has already been closed. It must be
@@ -159,6 +170,7 @@ func (c *Client) ExecuteCodeStream(code string, resultChan chan *ExecutionResult
 	}
 
 	state := newStreamExecutionState(time.Now())
+	state.msgID = msg.Header.MessageID
 
 	c.clearTemporaryHandlers()
 	c.registerExecuteCodeStreamHandlers(state, resultChan)
@@ -204,18 +216,31 @@ func (c *Client) buildExecuteMessage(code string) (*Message, error) {
 	return msg, nil
 }
 
+// registerExecuteCodeStreamHandlers registers the run's handlers. They are in place before the
+// request is sent, so nothing the kernel sends for it can arrive first. Replies, output and idle
+// statuses count only when they answer the run's request; a stopped kernel ends the run whatever
+// the parent, since its shutdown_reply answers Jupyter Server's shutdown_request and its restarting
+// and dead statuses come from Jupyter Server itself.
 func (c *Client) registerExecuteCodeStreamHandlers(state *streamExecutionState, resultChan chan *ExecutionResult) {
 	c.registerHandler(MsgExecuteReply, func(msg *Message) {
-		c.handleExecuteReply(msg, state)
+		if state.owns(msg) {
+			c.handleExecuteReply(msg, state)
+		}
 	})
 	c.registerHandler(MsgExecuteResult, func(msg *Message) {
-		c.handleExecuteResult(msg, state, resultChan)
+		if state.owns(msg) {
+			c.handleExecuteResult(msg, state, resultChan)
+		}
 	})
 	c.registerHandler(MsgStream, func(msg *Message) {
-		c.handleStreamOutput(msg, state, resultChan)
+		if state.owns(msg) {
+			c.handleStreamOutput(msg, state, resultChan)
+		}
 	})
 	c.registerHandler(MsgError, func(msg *Message) {
-		c.handleExecutionError(msg, state, resultChan)
+		if state.owns(msg) {
+			c.handleExecutionError(msg, state, resultChan)
+		}
 	})
 	c.registerHandler(MsgStatus, func(msg *Message) {
 		c.handleExecutionStatus(msg, state, resultChan)
@@ -311,8 +336,9 @@ func (c *Client) handleExecutionStatus(msg *Message, state *streamExecutionState
 	case StateDead:
 		c.handleKernelStopped(state, resultChan, "the kernel died before the execution finished")
 		return
-	case StateIdle:
-	default:
+	}
+	// Any other status answers one request, and only the idle for this run's request ends it.
+	if !state.owns(msg) || status.ExecutionState != StateIdle {
 		return
 	}
 

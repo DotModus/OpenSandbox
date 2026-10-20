@@ -393,10 +393,10 @@ func TestExecuteCodeStreamEndsWhenKernelStopsMidExecution(t *testing.T) {
 	}
 }
 
-// TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing covers a kernel that stops after an idle
-// status has already started finalizeExecution, so finalization is polling for a reply that will
-// never come. The KernelStopped error must still reach the client before the stream closes: the
-// error is sent before it is recorded, and recording it is what ends the poll.
+// TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing covers a kernel that stops after the
+// run's idle status has already started finalizeExecution, so finalization is polling for a reply
+// that will never come. The KernelStopped error must still reach the client before the stream
+// closes: the error is sent before it is recorded, and recording it is what ends the poll.
 func TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing(t *testing.T) {
 	previousPollInterval := execdflag.JupyterIdlePollInterval
 	execdflag.JupyterIdlePollInterval = 5 * time.Millisecond
@@ -414,8 +414,9 @@ func TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing(t *testing.T) {
 		session := executeRequest.Header.Session
 		idle, _ := json.Marshal(StatusUpdate{ExecutionState: StateIdle})
 		require.NoError(t, conn.WriteJSON(Message{
-			Header:  Header{MessageID: "stray-idle-id", Session: session, MessageType: string(MsgStatus)},
-			Content: idle,
+			Header:       Header{MessageID: "idle-id", Session: session, MessageType: string(MsgStatus)},
+			ParentHeader: executeRequest.Header,
+			Content:      idle,
 		}))
 		// Several poll intervals, so finalizeExecution is polling when the kernel stops.
 		time.Sleep(50 * time.Millisecond)
@@ -454,4 +455,171 @@ func TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing(t *testing.T) {
 			t.Fatal("the stream did not end after the kernel stopped")
 		}
 	}
+}
+
+func kernelMessage(t *testing.T, msgType MessageType, id, session string, parent Header, content interface{}) Message {
+	t.Helper()
+	raw, err := json.Marshal(content)
+	require.NoError(t, err)
+	return Message{
+		Header:       Header{MessageID: id, Session: session, MessageType: string(msgType)},
+		ParentHeader: parent,
+		Content:      raw,
+	}
+}
+
+// collectResults reads resultChan until it is closed, failing the test if that takes too long.
+func collectResults(t *testing.T, resultChan chan *ExecutionResult) []*ExecutionResult {
+	t.Helper()
+	var results []*ExecutionResult
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case result, open := <-resultChan:
+			if !open {
+				return results
+			}
+			results = append(results, result)
+		case <-deadline:
+			t.Fatal("the stream did not end")
+		}
+	}
+}
+
+// TestExecuteCodeStreamIgnoresIdleOfAnotherRequest covers the idle statuses that reach a run before
+// its own: Jupyter Server sends a kernel_info_request on every new websocket and the kernel's busy
+// and idle for it arrive on the run's connection. Such an idle must not start finalization, which
+// would report the run complete before its result. The run ends on its own idle and reply.
+func TestExecuteCodeStreamIgnoresIdleOfAnotherRequest(t *testing.T) {
+	previousPollInterval := execdflag.JupyterIdlePollInterval
+	execdflag.JupyterIdlePollInterval = time.Millisecond
+	t.Cleanup(func() {
+		execdflag.JupyterIdlePollInterval = previousPollInterval
+	})
+
+	release := make(chan struct{})
+	server := createTestServer(t, func(conn *websocket.Conn) {
+		var executeRequest Message
+		if err := conn.ReadJSON(&executeRequest); err != nil {
+			t.Errorf("failed to read execution request: %v", err)
+			return
+		}
+		session := executeRequest.Header.Session
+		own := executeRequest.Header
+		kernelInfo := Header{MessageID: "kernel-info-request-id", MessageType: string(MsgKernelInfo)}
+		for _, msg := range []Message{
+			kernelMessage(t, MsgStatus, "info-busy", session, kernelInfo, StatusUpdate{ExecutionState: StateBusy}),
+			kernelMessage(t, MsgStatus, "info-idle", session, kernelInfo, StatusUpdate{ExecutionState: StateIdle}),
+		} {
+			require.NoError(t, conn.WriteJSON(msg))
+		}
+		// Many poll intervals: a run that took that idle as its own would end here.
+		time.Sleep(50 * time.Millisecond)
+		for _, msg := range []Message{
+			kernelMessage(t, MsgStatus, "own-busy", session, own, StatusUpdate{ExecutionState: StateBusy}),
+			kernelMessage(t, MsgExecuteResult, "own-result", session, own, ExecuteResult{
+				ExecutionCount: 2,
+				Data:           map[string]interface{}{"text/plain": "own"},
+			}),
+			kernelMessage(t, MsgExecuteReply, "own-reply", session, own, ExecuteReply{ExecutionCount: 2, Status: "ok"}),
+			kernelMessage(t, MsgStatus, "own-idle", session, own, StatusUpdate{ExecutionState: StateIdle}),
+		} {
+			require.NoError(t, conn.WriteJSON(msg))
+		}
+		<-release
+	})
+	defer server.Close()
+	defer close(release)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	client := NewClient("", nil)
+	require.NoError(t, client.Connect(wsURL))
+	defer client.Disconnect()
+
+	resultChan := make(chan *ExecutionResult, 10)
+	require.NoError(t, client.ExecuteCodeStream("x", resultChan))
+
+	results := collectResults(t, resultChan)
+	resultAt, completeAt := -1, -1
+	for i, result := range results {
+		if result.ExecutionData != nil && resultAt < 0 {
+			resultAt = i
+		}
+		if result.ExecutionTime > 0 && completeAt < 0 {
+			completeAt = i
+		}
+	}
+	require.GreaterOrEqual(t, resultAt, 0, "expected the run's own result")
+	require.Equal(t, "own", results[resultAt].ExecutionData["text/plain"])
+	require.Greater(t, completeAt, resultAt, "the run must not complete before its own result")
+}
+
+// TestExecuteCodeStreamIgnoresOutputOfAnotherRequest covers output that belongs to an earlier
+// request: an earlier run that the client gave up on can still be running and finish while this
+// run waits. Its output and reply must not be reported as this run's, nor end it.
+func TestExecuteCodeStreamIgnoresOutputOfAnotherRequest(t *testing.T) {
+	previousPollInterval := execdflag.JupyterIdlePollInterval
+	execdflag.JupyterIdlePollInterval = time.Millisecond
+	t.Cleanup(func() {
+		execdflag.JupyterIdlePollInterval = previousPollInterval
+	})
+
+	release := make(chan struct{})
+	server := createTestServer(t, func(conn *websocket.Conn) {
+		var executeRequest Message
+		if err := conn.ReadJSON(&executeRequest); err != nil {
+			t.Errorf("failed to read execution request: %v", err)
+			return
+		}
+		session := executeRequest.Header.Session
+		own := executeRequest.Header
+		earlier := Header{MessageID: "earlier-execute-request-id", MessageType: string(MsgExecuteRequest)}
+		for _, msg := range []Message{
+			kernelMessage(t, MsgStream, "earlier-stream", session, earlier, StreamOutput{Name: StreamStdout, Text: "earlier\n"}),
+			kernelMessage(t, MsgError, "earlier-error", session, earlier, ErrorOutput{EName: "EarlierError", EValue: "earlier"}),
+			kernelMessage(t, MsgExecuteResult, "earlier-result", session, earlier, ExecuteResult{
+				ExecutionCount: 1,
+				Data:           map[string]interface{}{"text/plain": "earlier"},
+			}),
+			kernelMessage(t, MsgExecuteReply, "earlier-reply", session, earlier, ExecuteReply{ExecutionCount: 1, Status: "ok"}),
+			kernelMessage(t, MsgStatus, "earlier-idle", session, earlier, StatusUpdate{ExecutionState: StateIdle}),
+		} {
+			require.NoError(t, conn.WriteJSON(msg))
+		}
+		time.Sleep(50 * time.Millisecond)
+		for _, msg := range []Message{
+			kernelMessage(t, MsgStatus, "own-busy", session, own, StatusUpdate{ExecutionState: StateBusy}),
+			kernelMessage(t, MsgStream, "own-stream", session, own, StreamOutput{Name: StreamStdout, Text: "own\n"}),
+			kernelMessage(t, MsgExecuteReply, "own-reply", session, own, ExecuteReply{ExecutionCount: 2, Status: "ok"}),
+			kernelMessage(t, MsgStatus, "own-idle", session, own, StatusUpdate{ExecutionState: StateIdle}),
+		} {
+			require.NoError(t, conn.WriteJSON(msg))
+		}
+		<-release
+	})
+	defer server.Close()
+	defer close(release)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	client := NewClient("", nil)
+	require.NoError(t, client.Connect(wsURL))
+	defer client.Disconnect()
+
+	resultChan := make(chan *ExecutionResult, 10)
+	require.NoError(t, client.ExecuteCodeStream("print('own')", resultChan))
+
+	var streams []string
+	completed := false
+	for _, result := range collectResults(t, resultChan) {
+		require.Nil(t, result.Error, "an earlier request's error must not be reported for this run")
+		require.Nil(t, result.ExecutionData, "an earlier request's result must not be reported for this run")
+		for _, stream := range result.Stream {
+			streams = append(streams, stream.Text)
+		}
+		if result.ExecutionTime > 0 {
+			completed = true
+		}
+	}
+	require.Equal(t, []string{"own\n"}, streams)
+	require.True(t, completed, "expected the run to complete on its own idle and reply")
 }
