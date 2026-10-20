@@ -647,6 +647,120 @@ func TestExecuteCodeStreamIgnoresOutputOfAnotherRequest(t *testing.T) {
 	require.True(t, completed, "expected the run to complete on its own idle and reply")
 }
 
+// TestExecuteCodeStreamIgnoresReplyOfAnotherRequest covers an earlier request's execute_reply,
+// which can arrive at any point of the run. Taken as the run's own, its execution count would end
+// finalization before the run's own result, and its error would make a later kernel stop look
+// like a run that had already replied, so the KernelStopped error would never be sent.
+func TestExecuteCodeStreamIgnoresReplyOfAnotherRequest(t *testing.T) {
+	previousPollInterval := execdflag.JupyterIdlePollInterval
+	execdflag.JupyterIdlePollInterval = time.Millisecond
+	t.Cleanup(func() {
+		execdflag.JupyterIdlePollInterval = previousPollInterval
+	})
+
+	earlier := Header{MessageID: "earlier-execute-request-id", MessageType: string(MsgExecuteRequest)}
+	cases := []struct {
+		name string
+		// messages are sent after the run's own busy status.
+		messages func(t *testing.T, session string, own Header) [][]Message
+		check    func(t *testing.T, results []*ExecutionResult)
+	}{
+		{
+			name: "earlier reply while finalizing",
+			messages: func(t *testing.T, session string, own Header) [][]Message {
+				return [][]Message{
+					{
+						kernelMessage(t, MsgStatus, "own-idle", session, own, StatusUpdate{ExecutionState: StateIdle}),
+						kernelMessage(t, MsgExecuteReply, "earlier-reply", session, earlier, ExecuteReply{ExecutionCount: 1, Status: "ok"}),
+					},
+					{
+						kernelMessage(t, MsgExecuteResult, "own-result", session, own, ExecuteResult{
+							ExecutionCount: 2,
+							Data:           map[string]interface{}{"text/plain": "own"},
+						}),
+						kernelMessage(t, MsgExecuteReply, "own-reply", session, own, ExecuteReply{ExecutionCount: 2, Status: "ok"}),
+					},
+				}
+			},
+			check: func(t *testing.T, results []*ExecutionResult) {
+				var own bool
+				for _, result := range results {
+					if result.ExecutionData != nil {
+						require.Equal(t, "own", result.ExecutionData["text/plain"])
+						own = true
+					}
+				}
+				require.True(t, own, "the run's own result must arrive before the stream closes")
+			},
+		},
+		{
+			name: "earlier error reply, then the kernel dies",
+			messages: func(t *testing.T, session string, _ Header) [][]Message {
+				dead, _ := json.Marshal(StatusUpdate{ExecutionState: StateDead})
+				return [][]Message{
+					{
+						kernelMessage(t, MsgExecuteReply, "earlier-reply", session, earlier, ExecuteReply{
+							ExecutionCount: 1,
+							Status:         "error",
+							ErrorOutput:    ErrorOutput{EName: "EarlierError", EValue: "earlier"},
+						}),
+					},
+					{
+						{Header: Header{MessageID: "dead-id", Session: session, MessageType: string(MsgStatus)}, Content: dead, Channel: "iopub"},
+					},
+				}
+			},
+			check: func(t *testing.T, results []*ExecutionResult) {
+				var stopped *ErrorOutput
+				for _, result := range results {
+					if result.Error != nil {
+						stopped = result.Error
+					}
+				}
+				require.NotNil(t, stopped, "expected the KernelStopped error before the stream closed")
+				require.Equal(t, "KernelStopped", stopped.EName)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			release := make(chan struct{})
+			server := createTestServer(t, func(conn *websocket.Conn) {
+				var executeRequest Message
+				if err := conn.ReadJSON(&executeRequest); err != nil {
+					t.Errorf("failed to read execution request: %v", err)
+					return
+				}
+				session := executeRequest.Header.Session
+				own := executeRequest.Header
+				if !writeMessages(t, conn, kernelMessage(t, MsgStatus, "own-busy", session, own, StatusUpdate{ExecutionState: StateBusy})) {
+					return
+				}
+				for _, batch := range tc.messages(t, session, own) {
+					if !writeMessages(t, conn, batch...) {
+						return
+					}
+					// Many poll intervals between batches.
+					time.Sleep(20 * time.Millisecond)
+				}
+				<-release
+			})
+			defer server.Close()
+			defer close(release)
+
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+			client := NewClient("", nil)
+			require.NoError(t, client.Connect(wsURL))
+			defer client.Disconnect()
+
+			resultChan := make(chan *ExecutionResult, 10)
+			require.NoError(t, client.ExecuteCodeStream("x", resultChan))
+			tc.check(t, collectResults(t, resultChan))
+		})
+	}
+}
+
 func setKernelWake(t *testing.T, delay time.Duration, attempts int) {
 	t.Helper()
 	previousDelay, previousAttempts := kernelWakeDelay, kernelWakeAttempts
