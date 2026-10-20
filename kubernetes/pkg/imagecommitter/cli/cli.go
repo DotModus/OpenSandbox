@@ -56,6 +56,12 @@ func Run(ctx context.Context, args []string, config Config) error {
 	if err != nil {
 		return err
 	}
+	// Drop the containers a snapshot is never restored from before connecting
+	// to containerd, so nothing is paused on behalf of work that will not run.
+	commitRequest, unpauseRequest, err = applySkipList(operation, commitRequest, unpauseRequest, config.Output)
+	if err != nil {
+		return err
+	}
 
 	client, err := containerd.New(
 		containerdSocket(),
