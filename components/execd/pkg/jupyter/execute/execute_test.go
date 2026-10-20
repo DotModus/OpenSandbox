@@ -19,6 +19,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -622,4 +624,114 @@ func TestExecuteCodeStreamIgnoresOutputOfAnotherRequest(t *testing.T) {
 	}
 	require.Equal(t, []string{"own\n"}, streams)
 	require.True(t, completed, "expected the run to complete on its own idle and reply")
+}
+
+func setKernelWake(t *testing.T, delay time.Duration, attempts int) {
+	t.Helper()
+	previousDelay, previousAttempts := kernelWakeDelay, kernelWakeAttempts
+	kernelWakeDelay, kernelWakeAttempts = delay, attempts
+	t.Cleanup(func() {
+		kernelWakeDelay, kernelWakeAttempts = previousDelay, previousAttempts
+	})
+}
+
+// TestExecuteCodeStreamWakesKernelThatHasNotPickedUpTheRequest covers a kernel that leaves the
+// run's request unread on its shell socket until something new connects to the kernel. The
+// server here holds the request until a second websocket arrives, as such a kernel does; the run
+// must open one and then end normally.
+func TestExecuteCodeStreamWakesKernelThatHasNotPickedUpTheRequest(t *testing.T) {
+	setKernelWake(t, 20*time.Millisecond, 4)
+
+	var connections atomic.Int32
+	woken := make(chan struct{})
+	var wakeOnce sync.Once
+	release := make(chan struct{})
+	server := createTestServer(t, func(conn *websocket.Conn) {
+		if connections.Add(1) > 1 {
+			wakeOnce.Do(func() { close(woken) })
+			return
+		}
+		var executeRequest Message
+		if err := conn.ReadJSON(&executeRequest); err != nil {
+			t.Errorf("failed to read execution request: %v", err)
+			return
+		}
+		select {
+		case <-woken:
+		case <-release:
+			return
+		}
+		session := executeRequest.Header.Session
+		own := executeRequest.Header
+		for _, msg := range []Message{
+			kernelMessage(t, MsgStatus, "own-busy", session, own, StatusUpdate{ExecutionState: StateBusy}),
+			kernelMessage(t, MsgExecuteReply, "own-reply", session, own, ExecuteReply{ExecutionCount: 1, Status: "ok"}),
+			kernelMessage(t, MsgStatus, "own-idle", session, own, StatusUpdate{ExecutionState: StateIdle}),
+		} {
+			require.NoError(t, conn.WriteJSON(msg))
+		}
+		<-release
+	})
+	defer server.Close()
+	defer close(release)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	client := NewClient("", nil)
+	require.NoError(t, client.Connect(wsURL))
+	defer client.Disconnect()
+
+	resultChan := make(chan *ExecutionResult, 10)
+	require.NoError(t, client.ExecuteCodeStream("x = 1", resultChan))
+
+	completed := false
+	for _, result := range collectResults(t, resultChan) {
+		if result.ExecutionTime > 0 {
+			completed = true
+		}
+	}
+	require.True(t, completed)
+	require.GreaterOrEqual(t, connections.Load(), int32(2), "expected a second connection to wake the kernel")
+}
+
+// TestExecuteCodeStreamDoesNotWakeKernelThatPickedUpTheRequest: once any message for the request
+// arrives the kernel is working on it, however long it takes, and no extra connection is made.
+func TestExecuteCodeStreamDoesNotWakeKernelThatPickedUpTheRequest(t *testing.T) {
+	setKernelWake(t, 10*time.Millisecond, 4)
+
+	var connections atomic.Int32
+	release := make(chan struct{})
+	server := createTestServer(t, func(conn *websocket.Conn) {
+		if connections.Add(1) > 1 {
+			return
+		}
+		var executeRequest Message
+		if err := conn.ReadJSON(&executeRequest); err != nil {
+			t.Errorf("failed to read execution request: %v", err)
+			return
+		}
+		session := executeRequest.Header.Session
+		own := executeRequest.Header
+		require.NoError(t, conn.WriteJSON(kernelMessage(t, MsgStatus, "own-busy", session, own, StatusUpdate{ExecutionState: StateBusy})))
+		// Longer than every wake-up attempt put together.
+		time.Sleep(200 * time.Millisecond)
+		for _, msg := range []Message{
+			kernelMessage(t, MsgExecuteReply, "own-reply", session, own, ExecuteReply{ExecutionCount: 1, Status: "ok"}),
+			kernelMessage(t, MsgStatus, "own-idle", session, own, StatusUpdate{ExecutionState: StateIdle}),
+		} {
+			require.NoError(t, conn.WriteJSON(msg))
+		}
+		<-release
+	})
+	defer server.Close()
+	defer close(release)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	client := NewClient("", nil)
+	require.NoError(t, client.Connect(wsURL))
+	defer client.Disconnect()
+
+	resultChan := make(chan *ExecutionResult, 10)
+	require.NoError(t, client.ExecuteCodeStream("import time; time.sleep(0.2)", resultChan))
+	collectResults(t, resultChan)
+	require.Equal(t, int32(1), connections.Load(), "a kernel that picked up the request must not be woken")
 }

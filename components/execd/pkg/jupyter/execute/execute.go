@@ -28,6 +28,24 @@ import (
 	"github.com/gorilla/websocket"
 
 	execdflag "github.com/alibaba/opensandbox/execd/pkg/flag"
+	"github.com/alibaba/opensandbox/execd/pkg/log"
+)
+
+// A kernel can leave a request unread on its shell socket. ipykernel 7.0 to 7.3 sends replies
+// directly on the socket it reads requests from, and that send can consume the read event for a
+// request arriving at the same moment (ipython/ipykernel#1529, fixed in 7.4.0). The request then
+// stays unread until something else wakes the socket, such as a new connection to it. Jupyter
+// Server sends a kernel_info_request on every new websocket, and a run connects just before it
+// sends its request, so the reply to that kernel_info_request regularly meets the request.
+//
+// A run whose kernel has sent nothing for its request after kernelWakeDelay opens and closes
+// another websocket: Jupyter Server connects new sockets to the kernel for it, which wakes the
+// shell socket. Another message on the run's own connection would not: it arrives on the same zmq
+// pipe as the unread request, which raises no new read event. The delay doubles after each of
+// kernelWakeAttempts attempts.
+var (
+	kernelWakeDelay    = 500 * time.Millisecond
+	kernelWakeAttempts = 4
 )
 
 type HTTPClient interface {
@@ -109,6 +127,11 @@ type streamExecutionState struct {
 	// requests: the busy and idle statuses for Jupyter Server's kernel_info_request on connect, and
 	// the output of an earlier run that is still going. Those are not this run's.
 	msgID string
+	// pickedUp is closed by the first message for msgID: the kernel is working on the request.
+	pickedUp     chan struct{}
+	pickedUpOnce sync.Once
+	// ended is closed with resultChan.
+	ended chan struct{}
 
 	// chanMutex guards resultChan's close-vs-send race. state.result.ExecutionCount/Error can be
 	// set by handleExecuteReply with no corresponding resultChan send at all (e.g. plain print()
@@ -130,12 +153,18 @@ func newStreamExecutionState(startTime time.Time) *streamExecutionState {
 			Stream:        make([]*StreamOutput, 0),
 			ExecutionTime: 0,
 		},
+		pickedUp: make(chan struct{}),
+		ended:    make(chan struct{}),
 	}
 }
 
-// owns reports whether msg answers this run's request.
+// owns reports whether msg answers this run's request, and records that the kernel picked it up.
 func (state *streamExecutionState) owns(msg *Message) bool {
-	return msg.ParentHeader.MessageID == state.msgID
+	if msg.ParentHeader.MessageID != state.msgID {
+		return false
+	}
+	state.pickedUpOnce.Do(func() { close(state.pickedUp) })
+	return true
 }
 
 // trySend delivers notify on resultChan unless the channel has already been closed. It must be
@@ -157,6 +186,7 @@ func (state *streamExecutionState) closeResultChan(resultChan chan *ExecutionRes
 	defer state.chanMutex.Unlock()
 	state.closed = true
 	close(resultChan)
+	close(state.ended)
 }
 
 func (c *Client) ExecuteCodeStream(code string, resultChan chan *ExecutionResult) error {
@@ -179,7 +209,48 @@ func (c *Client) ExecuteCodeStream(code string, resultChan chan *ExecutionResult
 		return fmt.Errorf("failed to send execution request: %w", err)
 	}
 
+	delay, attempts := kernelWakeDelay, kernelWakeAttempts
+	safego.Go(func() { c.wakeKernelUntilPickedUp(state, delay, attempts) })
+
 	return nil
+}
+
+// wakeKernelUntilPickedUp wakes a kernel that has not picked up the run's request, see
+// kernelWakeDelay.
+func (c *Client) wakeKernelUntilPickedUp(state *streamExecutionState, delay time.Duration, attempts int) {
+	for range attempts {
+		timer := time.NewTimer(delay)
+		select {
+		case <-state.pickedUp:
+			timer.Stop()
+			return
+		case <-state.ended:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		log.Warn("jupyter: kernel has sent nothing for request %s after %s; waking it", state.msgID, time.Since(state.startTime))
+		c.wakeKernel()
+		delay *= 2
+	}
+}
+
+// wakeKernel opens and closes a websocket to the kernel. Jupyter Server connects new sockets to the
+// kernel for it, and the kernel's shell socket then reads any request it left unread.
+func (c *Client) wakeKernel() {
+	c.mu.Lock()
+	wsURL := c.wsURL
+	c.mu.Unlock()
+
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if resp != nil && err != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
+		log.Warn("jupyter: wake kernel: %v", err)
+		return
+	}
+	conn.Close()
 }
 
 func (c *Client) buildExecuteMessage(code string) (*Message, error) {
