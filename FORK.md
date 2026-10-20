@@ -11,8 +11,9 @@ when that run's execution ends, and no sooner.
 
 ### 1. execd ends a Jupyter run when its kernel stops
 
-A run whose kernel stops before replying never ended. Deleting the context of a running cell makes the
-kernel broadcast `shutdown_reply` and an `idle` status, and then it is killed.
+A run whose kernel stops before replying never ended. Deleting the context of
+a running cell makes the kernel broadcast `shutdown_reply` and an `idle`
+status, and then it is killed.
 It never sends the cell's `execute_reply`, and Jupyter Server keeps the kernel
 websocket open, so `finalizeExecution` waited for that reply forever and the
 `/code` stream stayed open, sending only pings, until the client gave up. A
@@ -57,10 +58,11 @@ The `components/execd/pkg/jupyter/execute` package is unchanged between
 
 Drop this patch when an upstream release ends a run whose kernel stops.
 
-### 2. execd matches a run's messages to its request, and wakes a kernel that left the request unread
+### 2. execd matches messages to the run's request and wakes a stalled kernel
 
 About one `/code` run in 50 on an existing context never ended. execd
-reported `execution_complete` almost at once, then the stream sent only pings. The context stayed busy for good: interrupting did nothing, and
+reported `execution_complete` almost at once, then the stream sent only
+pings. The context stayed busy for good: interrupting did nothing, and
 deleting the context ended the stream only through patch 1. Two defects
 combine here.
 
@@ -74,9 +76,10 @@ and that send can consume the read event for a request arriving at the same
 moment ([ipython/ipykernel#1529](https://github.com/ipython/ipykernel/pull/1529),
 fixed in ipykernel 7.4.0). The request is then not read until something else
 wakes the socket. `opensandbox/code-interpreter:v1.1.0` ships ipykernel 7.3.0.
-execd makes the collision common: it connects to the kernel once per run,
-Jupyter Server sends a `kernel_info_request` on every new websocket, and execd
-sends the run's request as soon as it is connected, so the reply to that
+execd makes the collision common: it connects to the kernel once per run;
+on every new websocket Jupyter Server sends a `kernel_info_request` on the
+shell and control channels (unless it believes the kernel is busy); and execd
+sends the run's request as soon as it is connected, so the shell reply to that
 `kernel_info_request` often goes out just as the request arrives. Re-arming
 the kernel's stream after each reply (a local patch to the kernel, to the same
 effect as the ipykernel 7.4.0 fix) removed every hang (0 in 300 runs).
@@ -84,11 +87,23 @@ effect as the ipykernel 7.4.0 fix) removed every hang (0 in 300 runs).
 If nothing for the run's request has arrived 500 ms after it was sent, execd now
 opens and closes another websocket to the kernel; Jupyter Server connects new
 sockets to the kernel for it, which wakes the shell socket. It tries up to four
-times, doubling the delay, and stops as soon as anything for the request
-arrives or the run ends. A kernel that picked up the request is never woken,
-however long the run takes. Sending another message on the run's own
-connection does not work (tried: every stalled request stayed unread through
-all four attempts): it queues behind the unread request on the same zmq pipe.
+times, doubling the delay (after 0.5, 1.5, 3.5 and 7.5 s). Before each attempt
+it stops if anything for the request has arrived, if the run has ended (its
+result channel is closed), or if the run's connection has been closed, as
+happens when the run's context is cancelled. A kernel that picked up the
+request is never woken, however long the run takes. Sending another message on
+the run's own connection does not work (tried: every stalled request stayed
+unread through all four attempts): it queues behind the unread request on the
+same zmq pipe.
+
+The 500 ms count from when execd writes the request, and a run can receive
+nothing for longer without any stall: Jupyter Server forwards the request only
+after its own `kernel_info_request` round on the new websocket, and a kernel
+still busy with an earlier request (a run whose client gave up, say) sends
+nothing for the new one until it finishes. Such a run gets up to four
+wake-ups, each a websocket opened and closed (Jupyter Server sends no
+`kernel_info_request` to a kernel it believes busy), and an info-level log line
+that says nothing has arrived yet.
 
 **Messages were not matched to the request.** A run's websocket also carries
 messages for other requests: the `busy` and `idle` statuses for Jupyter
@@ -97,10 +112,13 @@ and reply of an earlier run that is still going. The handlers ignored
 `parent_header`, so that `idle` started `finalizeExecution` on almost every
 run and `execution_complete` could come before the result (in 24 of the 300
 upstream runs below), and another request's output, error or execution count
-was reported as the run's. Replies, output and
-`idle` statuses now count only when their parent is the run's
-`execute_request`. `shutdown_reply`, status `restarting` and status `dead`
-still end the run whatever the parent (patch 1).
+was reported as the run's. An earlier request's reply could also end
+finalization before the run's own result arrived, and an error in it made a
+later kernel stop look like a run that had already replied, so no
+`KernelStopped` error was sent. Replies, output and `idle` statuses now count
+only when their parent is the run's `execute_request`. `shutdown_reply`,
+status `restarting` and status `dead` still end the run whatever the parent
+(patch 1).
 
 Each kernel websocket is also now read only by the reader started for it.
 The reader used to look up the client's current connection before every
@@ -118,10 +136,11 @@ when its stream had not ended after 8 s:
 | upstream `release-1.1.1` | 300 | 6 (deleting the context did not end them) | 24 |
 | patch 1 only | 300 | 6 (deleting the context ended them, `KernelStopped`) | 43 |
 | patches 1 and 2 | 600 | 0 | 0 |
+| patches 1 and 2, after review | 600 | 0 | 0 |
 
-With both patches the kernel left 10 of the 600 requests unread; one wake-up
-each made it read them, those runs took about 0.5 s longer, and every run
-returned its own result.
+With both patches the kernel left 10 and 19 of the requests unread in the two
+runs; one wake-up each made it read them, those runs took about 0.5 s longer,
+and every run returned its own result.
 
 What this does not cover:
 
@@ -142,7 +161,10 @@ unchanged between this tag and upstream `main` on 2026-10-20.
 
 Drop the message matching and the reader change when an upstream release
 matches a run's messages to its request. Drop the wake-up when the kernels
-execd drives run ipykernel 7.4.0 or later.
+execd drives run ipykernel 7.4.0 or later. `opensandbox/code-interpreter:v1.1.0`
+can select Python 3.10 to 3.14, each with ipykernel 7.3.0, and ipykernel 7.4.0
+requires Python 3.11 or later, so that cannot happen while the image keeps its
+Python 3.10 environment.
 
 ## Rules for this branch
 
