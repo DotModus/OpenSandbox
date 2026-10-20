@@ -76,7 +76,7 @@ func (c *Client) Connect(wsURL string) error {
 
 	c.registerDefaultHandlers()
 
-	safego.Go(func() { c.receiveMessages() })
+	safego.Go(func() { c.receiveMessages(conn) })
 
 	return nil
 }
@@ -532,21 +532,15 @@ func (c *Client) clearTemporaryHandlers() {
 	c.registerDefaultHandlers()
 }
 
-func (c *Client) receiveMessages() {
+// receiveMessages dispatches the messages read from conn until it is closed. It reads only the
+// connection it was started for: a reader still handling a message when its run disconnects must
+// not go on to read the next run's connection alongside that connection's own reader.
+func (c *Client) receiveMessages(conn *websocket.Conn) {
 	for {
-		c.mu.Lock()
-		conn := c.conn
-		c.mu.Unlock()
-
-		if conn == nil {
-			break
-		}
-
 		var msg Message
-		err := conn.ReadJSON(&msg)
-		if err != nil {
+		if err := conn.ReadJSON(&msg); err != nil {
 			// connection may already be closed
-			break
+			return
 		}
 
 		c.handleMessage(&msg)
