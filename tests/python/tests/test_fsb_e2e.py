@@ -366,6 +366,31 @@ class TestFsbE2E:
         try:
             assert sandbox.origin == SandboxOrigin.TEMPLATE
 
+            context = await manager.get_diagnostic_context(sandbox.id)
+            current = await sandbox.get_diagnostic_context()
+            assert context.sandbox_id == current.sandbox_id == sandbox.id
+            assert context.backend_type == current.backend_type == "fast-sandbox"
+            assert context.backend_identifiers == current.backend_identifiers == {}
+            assert context.state
+            logger.info("Fast Sandbox diagnostic context: %s", context.model_dump())
+            for scope in ("runtime", "all"):
+                for events in (
+                    await manager.get_diagnostic_events(sandbox.id, scope),
+                    await sandbox.get_diagnostic_events(scope),
+                ):
+                    assert events.sandbox_id == sandbox.id
+                    assert events.kind == "events"
+                    assert events.scope == scope
+                    assert events.delivery == "inline"
+                    assert isinstance(events.content, str)
+            for get_logs in (
+                lambda: manager.get_diagnostic_logs(sandbox.id, "container"),
+                lambda: sandbox.get_diagnostic_logs("container"),
+            ):
+                with pytest.raises(SandboxApiException) as error:
+                    await get_logs()
+                assert error.value.status_code == 501
+
             # HTTP-level enforcement probe: busybox wget performs a real
             # HTTPS request, covering both gates of the fsb dns+nft chain
             # (DNS resolution and transport).
@@ -514,6 +539,67 @@ class TestFsbE2E:
             assert abs(
                 (after.expires_at - renewed.expires_at).total_seconds()
             ) < 1
+        finally:
+            await _kill_and_wait_gone(manager, sandbox.id)
+
+    @pytest.mark.timeout(600)
+    async def test_02b_network_policy_rejects_port_scoped_rules(
+        self, manager: SandboxManager, connection_config
+    ) -> None:
+        """Fast-sandbox enforcement does not cover port-scoped rules yet, so
+        the server must fail closed with 400 on both the create-carried
+        policy and the PATCH route instead of silently installing rules the
+        fastlet nft path would ignore (a dropped deny rule fails open)."""
+        logger.info("TEST 2b: fsb networkPolicy rejects port-scoped rules")
+
+        # Create-carried policy: a rule that pairs ports with an IP target is
+        # rejected the same as a port-only rule.
+        with pytest.raises(SandboxApiException) as create_exc:
+            await Sandbox.create_from_template(
+                FSB_TEMPLATE_ID,
+                timeout=timedelta(hours=1),
+                ready_timeout=COLD_READY_TIMEOUT,
+                connection_config=connection_config,
+                metadata={"origin": "fsb-port-scope-reject"},
+                network_policy=NetworkPolicy(
+                    defaultAction="deny",
+                    egress=[NetworkRule(action="allow", target="1.1.1.1", ports=[443])],
+                ),
+            )
+        assert create_exc.value.status_code == 400, (
+            "fsb create with a port-scoped rule must be rejected with 400"
+        )
+
+        # A policy-only sandbox so the PATCH rejection can be asserted
+        # against a live fsb sandbox; killed in the finally block.
+        sandbox = await Sandbox.create_from_template(
+            FSB_TEMPLATE_ID,
+            timeout=timedelta(hours=1),
+            ready_timeout=COLD_READY_TIMEOUT,
+            connection_config=connection_config,
+            metadata={"origin": "fsb-port-scope-reject"},
+            network_policy=NetworkPolicy(
+                defaultAction="deny",
+                egress=[NetworkRule(action="allow", target="example.com")],
+            ),
+        )
+        try:
+            for rules in (
+                [NetworkRule(action="deny", ports=[25])],
+                [NetworkRule(action="allow", target="1.1.1.1", ports=[443])],
+            ):
+                with pytest.raises(SandboxApiException) as patch_exc:
+                    await sandbox.patch_egress_rules(rules)
+                assert patch_exc.value.status_code == 400, (
+                    "fsb PATCH with a port-scoped rule must be rejected with 400"
+                )
+
+            # The rejected PATCHes must not have mutated the policy.
+            policy = await _get_policy_tolerant(sandbox)
+            assert policy is not None
+            assert all(rule.ports is None for rule in policy.egress or [])
+            assert any(rule.target == "example.com" for rule in policy.egress or [])
+            logger.info("fsb port-scoped rejection verified (create + PATCH)")
         finally:
             await _kill_and_wait_gone(manager, sandbox.id)
 

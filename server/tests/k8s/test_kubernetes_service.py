@@ -34,10 +34,12 @@ from opensandbox_server.services.constants import (
 )
 from opensandbox_server.api.schema import (
     CredentialProxyConfig,
+    IdlePolicy,
     ImageAuth,
     ListSandboxesRequest,
     NetworkPolicy,
     PlatformSpec,
+    SandboxLifecycle,
 )
 from opensandbox_server.config import (
     EGRESS_MODE_DNS,
@@ -561,6 +563,25 @@ class TestKubernetesSandboxServiceCreate:
         assert exc_info.value.status_code == 400
         assert exc_info.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
         assert "ingress.mode='gateway'" in exc_info.value.detail["message"]
+        k8s_service.workload_provider.create_workload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_sandbox_rejects_idle_policy_on_pod_backend(
+        self, k8s_service, create_sandbox_request
+    ):
+        # OSEP-0024: auto-pause/wake is fsb-only; pods must refuse the opt-in
+        # instead of silently ignoring it.
+        create_sandbox_request.lifecycle = SandboxLifecycle(
+            idlePolicy=IdlePolicy(idleTimeoutSeconds=300, onIdle="pause")
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await k8s_service.create_sandbox(create_sandbox_request)
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == SandboxErrorCodes.INVALID_PARAMETER
+        assert "idlePolicy" in exc_info.value.detail["message"]
+        assert "fast-sandbox" in exc_info.value.detail["message"]
         k8s_service.workload_provider.create_workload.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1097,6 +1118,28 @@ class TestWaitForSandboxReady:
         detail = cast(dict[str, str], exc_info.value.detail)
         assert detail["code"] == SandboxErrorCodes.K8S_POD_FAILED
         assert "InitContainerFailed" in detail["message"]
+        assert k8s_service.workload_provider.get_status.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_wait_stops_when_sandbox_is_already_expired(self, k8s_service, mock_workload):
+        k8s_service.workload_provider.get_workload.return_value = mock_workload
+        k8s_service.workload_provider.get_status.return_value = {
+            "state": "Terminated",
+            "reason": "SANDBOX_EXPIRED",
+            "message": "Sandbox expired",
+            "last_transition_at": datetime.now(timezone.utc),
+        }
+
+        with pytest.raises(HTTPException) as exc_info:
+            await k8s_service._wait_for_sandbox_ready(
+                "test-sandbox-id",
+                timeout_seconds=600,
+                poll_interval_seconds=1,
+            )
+
+        assert exc_info.value.status_code == 409
+        detail = cast(dict[str, str], exc_info.value.detail)
+        assert "SANDBOX_EXPIRED" in detail["message"]
         assert k8s_service.workload_provider.get_status.call_count == 1
     
     @pytest.mark.asyncio
@@ -2360,6 +2403,34 @@ class TestAttachPvcOwnerReferences:
 
 
 class TestListSandboxes:
+    def test_deleting_batchsandbox_status_in_list_and_get(self, k8s_service, mock_workload):
+        from opensandbox_server.api.schema import PaginationRequest, SandboxFilter
+        from opensandbox_server.services.k8s.batchsandbox_provider import BatchSandboxProvider
+
+        deletion_timestamp = datetime(2026, 10, 8, 10, tzinfo=timezone.utc)
+        mock_workload["metadata"]["deletionTimestamp"] = deletion_timestamp.isoformat()
+        mock_workload["status"] = {"phase": "Pending", "ready": 0}
+        provider = k8s_service.workload_provider
+        provider.list_workloads.return_value = [mock_workload]
+        provider.get_workload.return_value = mock_workload
+        provider.get_status.side_effect = BatchSandboxProvider(MagicMock()).get_status
+        provider.get_expiration.return_value = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        request = ListSandboxesRequest(
+            filter=SandboxFilter(state=["Stopping"]), pagination=PaginationRequest(page=1, page_size=20)
+        )
+        response = k8s_service.list_sandboxes(request)
+        assert response.pagination.total_items == 1
+        assert len(response.items) == 1
+        sandbox = k8s_service.get_sandbox("test-sandbox-123")
+        for result in (response.items[0], sandbox):
+            assert result.status.state == "Stopping"
+            assert result.status.reason == "DELETING"
+            assert result.status.last_transition_at == deletion_timestamp
+
+        request.filter.state = ["Pending"]
+        assert not k8s_service.list_sandboxes(request).items
+
     
     def test_list_all_sandboxes_succeeds(self, k8s_service, mock_workload):
         k8s_service.workload_provider.list_workloads.return_value = [mock_workload]

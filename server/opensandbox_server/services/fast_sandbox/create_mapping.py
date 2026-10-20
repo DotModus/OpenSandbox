@@ -278,10 +278,20 @@ def _canonical_quantity(value: str) -> decimal.Decimal:
 def _reject_unsupported_fields(request: CreateSandboxRequest) -> None:
     """Reject pod-identity-dependent fields that have no shared-Fastlet meaning."""
     if request.lifecycle is not None:
-        raise UnsupportedFieldError(
-            "lifecycle",
-            "lifecycle hooks are not supported by the fsb backend",
-        )
+        if request.lifecycle.has_hooks:
+            raise UnsupportedFieldError(
+                "lifecycle",
+                "lifecycle hooks are not supported by the fsb backend; "
+                "only lifecycle.idlePolicy is accepted (OSEP-0024)",
+            )
+        if request.lifecycle.renewal_policy is not None:
+            raise UnsupportedFieldError(
+                "lifecycle.renewalPolicy",
+                "renew-on-access is not supported by the fsb backend; fsb rejects "
+                "the deprecated extensions['access.renew.extend.seconds'] key too "
+                "(OSEP-0009)",
+            )
+        # idlePolicy is validated and persisted as a CR annotation by the service.
     # snapshotId is allowed: restore resolution replaced it with the snapshot
     # artifact reference (restore_config.image) before routing reached fsb.
     if request.platform is not None:
@@ -291,12 +301,9 @@ def _reject_unsupported_fields(request: CreateSandboxRequest) -> None:
             "resourceRequests",
             "resources are fixed by SandboxPool.spec.sandboxResources",
         )
-    if request.credential_proxy is not None and request.credential_proxy.enabled:
-        raise UnsupportedFieldError(
-            "credentialProxy",
-            "credential proxy rides the per-pod egress sidecar, which does not "
-            "exist in the shared-Fastlet model",
-        )
+    # credentialProxy is accepted and ignored at create time (OSEP-0022):
+    # the vault is not carried at create — it is set after creation through
+    # the server vault API over the FastPath handler relay.
     if request.volumes:
         raise UnsupportedFieldError(
             "volumes", "Fastlet child containers cannot receive dynamic mounts"

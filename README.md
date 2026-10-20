@@ -30,15 +30,13 @@ OpenSandbox gives AI applications isolated environments to execute code, run com
 
 | Feature | What it enables | Learn more |
 |---------|-----------------|------------|
-| **Fast Sandbox runtime** | Fast, high-density sandboxes on Kubernetes. Reference warm Firecracker creation: **97 ms P50 (serial)** / **308 ms P99 (10 concurrent)**. Firecracker sandboxes support pause/resume with memory and disk state preserved. | [Integration](docs/architecture/fast-sandbox/index.md) · [Performance](docs/architecture/fast-sandbox/performance.md) · [Pause/resume](docs/architecture/fast-sandbox/checkpoints.md) |
+| **Fast Sandbox runtime** | Fast, high-density sandboxes on Kubernetes. Firecracker creation: **64 ms P50 (serial)** / **125.4 ms P99 (10 concurrent)**. Firecracker sandboxes support pause/resume with memory and disk state preserved. | [Integration](docs/architecture/fast-sandbox/index.md) · [Performance](docs/architecture/fast-sandbox/performance.md) · [Pause/resume](docs/architecture/fast-sandbox/checkpoints.md) |
 | **Agent working environments** | Execute commands, manage files, and run code with built-in APIs. Integration examples show how to run coding agents, browsers, and desktops inside sandboxes. | [Examples](docs/examples/index.md) |
 | **Network access control** | Route inbound traffic through a unified ingress gateway and control outbound access with per-sandbox egress policies. | [Ingress](docs/architecture/network/ingress.md) · [Egress](docs/architecture/network/egress.md) |
 | **Credential Vault** | Let agents call external services without exposing real credentials to sandbox workloads. | [Credential Vault](docs/guides/credential-vault.md) |
 | **Local to cluster** | Start with Docker and deploy on Kubernetes through a unified lifecycle API. Resource pools and batch creation support agent evaluation and RL training workloads. | [Kubernetes runtime](docs/architecture/control-plane/operator.md) |
 | **SDKs, CLI, and MCP** | Integrate with Python, Java/Kotlin, TypeScript/JavaScript, C#/.NET, or Go SDKs. Use `osb` from the terminal or connect agents through MCP. | [SDKs](#sdks) · [CLI](#cli) · [MCP](#mcp) |
 | **Extensible sandbox protocol** | Build custom runtime integrations against defined sandbox lifecycle and execution APIs. | [API specs](specs/README.md) |
-
-Performance figures measure Python SDK create through a successful execd health check via the gateway: 100 creates per load shape on the reference host, with template artifacts cached. See the [test setup and results](docs/architecture/fast-sandbox/performance.md).
 
 ## Getting Started
 
@@ -239,17 +237,13 @@ See the [MCP README](sdks/mcp/sandbox/python/README.md) for client-specific setu
 
 ## Official Container Images
 
-OpenSandbox release images are published under the same component name in
-three official registries:
+OpenSandbox release images are published under the same component name in three official registries:
 
 - Docker Hub: `docker.io/opensandbox/<component>`
 - GitHub Container Registry: `ghcr.io/opensandbox-group/opensandbox/<component>`
 - Alibaba Cloud Container Registry: `sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/<component>`
 
-Tagged release images are signed keylessly with Cosign and include provenance
-attestations. Pin production images by digest and follow the
-[release verification guide](docs/community/release-verification.md) to verify
-the image against the OpenSandbox GitHub Actions identity before deployment.
+Tagged release images are signed keylessly with Cosign and include provenance attestations. Pin production images by digest and follow the [release verification guide](docs/community/release-verification.md) to verify the image against the OpenSandbox GitHub Actions identity before deployment.
 
 ## Documentation
 

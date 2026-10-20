@@ -58,7 +58,10 @@ from opensandbox_server.api.schema import (
     PlatformSpec,
 )
 from opensandbox_server.config import AppConfig, get_config
-from opensandbox_server.services.docker.docker_diagnostics import DockerDiagnosticsMixin
+from opensandbox_server.services.docker.docker_diagnostics import (
+    DockerDiagnosticsMixin,
+    _container_lifecycle_state,
+)
 from opensandbox_server.services.docker.runtime import (
     DockerRuntimeMixin,
 )
@@ -525,42 +528,8 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
             )
 
         status_section = container.attrs.get("State", {})
-        status_value = (status_section.get("Status") or container.status or "").lower()
-        running = status_section.get("Running", False)
-        paused = status_section.get("Paused", False)
-        restarting = status_section.get("Restarting", False)
-        exit_code = status_section.get("ExitCode")
         finished_at = status_section.get("FinishedAt")
-
-        if running and not paused:
-            state = "Running"
-            reason = "CONTAINER_RUNNING"
-            message = "Sandbox container is running."
-        elif paused:
-            state = "Paused"
-            reason = "CONTAINER_PAUSED"
-            message = "Sandbox container is paused."
-        elif restarting:
-            state = "Running"
-            reason = "CONTAINER_RESTARTING"
-            message = "Sandbox container is restarting."
-        elif status_value in {"created", "starting"}:
-            state = "Pending"
-            reason = "CONTAINER_STARTING"
-            message = "Sandbox container is starting."
-        elif status_value in {"exited", "dead"}:
-            if exit_code == 0:
-                state = "Terminated"
-                reason = "CONTAINER_EXITED"
-                message = "Sandbox container exited successfully."
-            else:
-                state = "Failed"
-                reason = "CONTAINER_EXITED_ERROR"
-                message = f"Sandbox container exited with code {exit_code}."
-        else:
-            state = "Unknown"
-            reason = "CONTAINER_STATE_UNKNOWN"
-            message = f"Sandbox container is in state '{status_value or 'unknown'}'."
+        state, reason, message = _container_lifecycle_state(container)
 
         metadata = self._metadata_store.get(resolved_id, labels)
         entrypoint = container.attrs.get("Config", {}).get("Cmd") or []
@@ -613,13 +582,25 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
 
     async def create_sandbox(self, request: CreateSandboxRequest) -> CreateSandboxResponse:
         if request.lifecycle is not None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "code": SandboxErrorCodes.INVALID_PARAMETER,
-                    "message": "lifecycle hooks are not supported by the Docker provider.",
-                },
-            )
+            # renewalPolicy (OSEP-0009) is control-plane state, persisted as a
+            # label; hooks and idlePolicy stay unsupported on docker.
+            unsupported: list[str] = []
+            if request.lifecycle.has_hooks:
+                unsupported.append("lifecycle.preStart/periodic hooks")
+            if request.lifecycle.idle_policy is not None:
+                unsupported.append("lifecycle.idlePolicy")
+            if unsupported:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": SandboxErrorCodes.INVALID_PARAMETER,
+                        "message": (
+                            f"{', '.join(unsupported)} not supported by the Docker "
+                            "provider; only lifecycle.renewalPolicy (OSEP-0009) is "
+                            "accepted on the lifecycle object."
+                        ),
+                    },
+                )
         if (request.extensions or {}).get("poolRef", "").strip():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -652,8 +633,8 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 },
             ) from e
 
-        pvc_inspect_cache, auto_created_volumes = self._validate_volumes(request)
         sandbox_id, created_at, expires_at = self._prepare_creation_context(request)
+        pvc_inspect_cache, auto_created_volumes = self._validate_volumes(request)
         loop = asyncio.get_running_loop()
         future: asyncio.Future[CreateSandboxResponse] = loop.create_future()
 
@@ -666,6 +647,18 @@ class DockerSandboxService(DockerDiagnosticsMixin, DockerRuntimeMixin, DockerVol
                 )
                 loop.call_soon_threadsafe(future.set_result, result)
             except BaseException as exc:
+                # _provision_sandbox only removes these when it fails inside its
+                # main try block. Earlier failures (the image pull, request
+                # checks) would leak them, and delete_sandbox never runs for a
+                # sandbox that was never created. Removal is idempotent, and a
+                # cleanup error must not keep exc from reaching the caller.
+                try:
+                    self._cleanup_managed_volumes(sandbox_id, auto_created_volumes)
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    logger.warning(
+                        f"sandbox={sandbox_id} | failed to clean up volumes "
+                        f"after create failure: {cleanup_exc}"
+                    )
                 try:
                     loop.call_soon_threadsafe(future.set_exception, exc)
                 except RuntimeError:
