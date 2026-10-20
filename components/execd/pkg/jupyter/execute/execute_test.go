@@ -282,3 +282,176 @@ func TestExecuteCodeStreamFallsBackWhenPollIntervalIsNonPositive(t *testing.T) {
 	require.GreaterOrEqual(t, elapsed, 90*time.Millisecond, "expected non-positive poll interval to fall back to runtime default (100ms)")
 	require.Less(t, elapsed, 300*time.Millisecond, "expected fallback poll interval to still close stream promptly")
 }
+
+// TestExecuteCodeStreamEndsWhenKernelStopsMidExecution covers a kernel that goes away while a
+// cell is still running in native code that ignores interrupts. Deleting its context makes the
+// kernel broadcast shutdown_reply and an idle status, and then it is killed: it never sends the
+// cell's execute_reply, and Jupyter Server keeps the websocket open. A kernel that dies on its
+// own is reported by the server as status restarting or dead, again with no reply. In every case
+// the stream must end with an error instead of waiting for a reply that will never come. A kernel
+// that replied and then died before its idle status must still end the stream, without an error.
+func TestExecuteCodeStreamEndsWhenKernelStopsMidExecution(t *testing.T) {
+	shutdownRequest := Header{MessageID: "shutdown-request-id", MessageType: "shutdown_request"}
+	cases := []struct {
+		name     string
+		messages func(session string, executeRequest Header) []Message
+		replied  bool
+	}{
+		{
+			name: "context deleted (shutdown_reply)",
+			messages: func(session string, _ Header) []Message {
+				reply, _ := json.Marshal(map[string]interface{}{"status": "ok", "restart": false})
+				idle, _ := json.Marshal(StatusUpdate{ExecutionState: StateIdle})
+				return []Message{
+					{Header: Header{MessageID: "shutdown-reply-id", Session: session, MessageType: string(MsgShutdownReply)}, ParentHeader: shutdownRequest, Content: reply, Channel: "iopub"},
+					{Header: Header{MessageID: "shutdown-idle-id", Session: session, MessageType: string(MsgStatus)}, ParentHeader: shutdownRequest, Content: idle, Channel: "iopub"},
+				}
+			},
+		},
+		{
+			name: "kernel died and is restarting",
+			messages: func(session string, _ Header) []Message {
+				restarting, _ := json.Marshal(StatusUpdate{ExecutionState: StateRestarting})
+				return []Message{{Header: Header{MessageID: "restarting-id", Session: session, MessageType: string(MsgStatus)}, Content: restarting, Channel: "iopub"}}
+			},
+		},
+		{
+			name: "kernel died and could not restart",
+			messages: func(session string, _ Header) []Message {
+				dead, _ := json.Marshal(StatusUpdate{ExecutionState: StateDead})
+				return []Message{{Header: Header{MessageID: "dead-id", Session: session, MessageType: string(MsgStatus)}, Content: dead, Channel: "iopub"}}
+			},
+		},
+		{
+			name: "kernel replied, then died before its idle status",
+			messages: func(session string, executeRequest Header) []Message {
+				reply, _ := json.Marshal(ExecuteReply{ExecutionCount: 1})
+				restarting, _ := json.Marshal(StatusUpdate{ExecutionState: StateRestarting})
+				return []Message{
+					{Header: Header{MessageID: "execute-reply-id", Session: session, MessageType: string(MsgExecuteReply)}, ParentHeader: executeRequest, Content: reply, Channel: "shell"},
+					{Header: Header{MessageID: "restarting-id", Session: session, MessageType: string(MsgStatus)}, Content: restarting, Channel: "iopub"},
+				}
+			},
+			replied: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			release := make(chan struct{})
+			server := createTestServer(t, func(conn *websocket.Conn) {
+				var executeRequest Message
+				if err := conn.ReadJSON(&executeRequest); err != nil {
+					t.Errorf("failed to read execution request: %v", err)
+					return
+				}
+				busy, _ := json.Marshal(StatusUpdate{ExecutionState: StateBusy})
+				require.NoError(t, conn.WriteJSON(Message{
+					Header:       Header{MessageID: "busy-id", Session: executeRequest.Header.Session, MessageType: string(MsgStatus)},
+					ParentHeader: executeRequest.Header,
+					Content:      busy,
+				}))
+				for _, msg := range tc.messages(executeRequest.Header.Session, executeRequest.Header) {
+					require.NoError(t, conn.WriteJSON(msg))
+				}
+				// Jupyter Server leaves the websocket open after the kernel is gone.
+				<-release
+			})
+			defer server.Close()
+			defer close(release)
+
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+			client := NewClient("", nil)
+			require.NoError(t, client.Connect(wsURL))
+			defer client.Disconnect()
+
+			resultChan := make(chan *ExecutionResult, 10)
+			require.NoError(t, client.ExecuteCodeStream("import duckdb  # a join that ignores interrupts", resultChan))
+
+			var stopped *ErrorOutput
+			deadline := time.After(2 * time.Second)
+			for {
+				select {
+				case result, open := <-resultChan:
+					if !open {
+						if tc.replied {
+							require.Nil(t, stopped, "a run that already replied must not get a KernelStopped error")
+							return
+						}
+						require.NotNil(t, stopped, "expected an error result before the stream closed")
+						require.Equal(t, "KernelStopped", stopped.EName)
+						return
+					}
+					if result != nil && result.Error != nil {
+						stopped = result.Error
+					}
+				case <-deadline:
+					t.Fatal("the stream did not end after the kernel stopped")
+				}
+			}
+		})
+	}
+}
+
+// TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing covers a kernel that stops after an idle
+// status has already started finalizeExecution, so finalization is polling for a reply that will
+// never come. The KernelStopped error must still reach the client before the stream closes: the
+// error is sent before it is recorded, and recording it is what ends the poll.
+func TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing(t *testing.T) {
+	previousPollInterval := execdflag.JupyterIdlePollInterval
+	execdflag.JupyterIdlePollInterval = 5 * time.Millisecond
+	t.Cleanup(func() {
+		execdflag.JupyterIdlePollInterval = previousPollInterval
+	})
+
+	release := make(chan struct{})
+	server := createTestServer(t, func(conn *websocket.Conn) {
+		var executeRequest Message
+		if err := conn.ReadJSON(&executeRequest); err != nil {
+			t.Errorf("failed to read execution request: %v", err)
+			return
+		}
+		session := executeRequest.Header.Session
+		idle, _ := json.Marshal(StatusUpdate{ExecutionState: StateIdle})
+		require.NoError(t, conn.WriteJSON(Message{
+			Header:  Header{MessageID: "stray-idle-id", Session: session, MessageType: string(MsgStatus)},
+			Content: idle,
+		}))
+		// Several poll intervals, so finalizeExecution is polling when the kernel stops.
+		time.Sleep(50 * time.Millisecond)
+		restarting, _ := json.Marshal(StatusUpdate{ExecutionState: StateRestarting})
+		require.NoError(t, conn.WriteJSON(Message{
+			Header:  Header{MessageID: "restarting-id", Session: session, MessageType: string(MsgStatus)},
+			Content: restarting,
+		}))
+		<-release
+	})
+	defer server.Close()
+	defer close(release)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	client := NewClient("", nil)
+	require.NoError(t, client.Connect(wsURL))
+	defer client.Disconnect()
+
+	resultChan := make(chan *ExecutionResult, 10)
+	require.NoError(t, client.ExecuteCodeStream("import duckdb  # a join that ignores interrupts", resultChan))
+
+	var stopped *ErrorOutput
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case result, open := <-resultChan:
+			if !open {
+				require.NotNil(t, stopped, "the KernelStopped error must arrive before the stream closes")
+				require.Equal(t, "KernelStopped", stopped.EName)
+				return
+			}
+			if result != nil && result.Error != nil {
+				stopped = result.Error
+			}
+		case <-deadline:
+			t.Fatal("the stream did not end after the kernel stopped")
+		}
+	}
+}
