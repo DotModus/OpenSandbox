@@ -824,3 +824,65 @@ func TestExecuteCodeStreamStopsWakingKernel(t *testing.T) {
 		})
 	}
 }
+
+// TestReceiveMessagesReadsOnlyItsOwnConnection covers a reader that is still handling a message
+// when its run disconnects and the next run connects. It must stop with its own connection, not
+// go on to read the new one alongside that connection's own reader.
+func TestReceiveMessagesReadsOnlyItsOwnConnection(t *testing.T) {
+	serversDone := make(chan struct{})
+	first := createTestServer(t, func(conn *websocket.Conn) {
+		if !writeMessages(t, conn, kernelMessage(t, MsgStream, "first-stream", "session", Header{}, StreamOutput{Name: StreamStdout, Text: "first\n"})) {
+			return
+		}
+		<-serversDone
+	})
+	defer first.Close()
+	second := createTestServer(t, func(_ *websocket.Conn) {
+		<-serversDone
+	})
+	defer second.Close()
+	defer close(serversDone)
+
+	client := NewClient("", nil)
+	handling := make(chan struct{})
+	unblock := make(chan struct{})
+	var handlingOnce sync.Once
+	client.registerHandler(MsgStream, func(*Message) {
+		handlingOnce.Do(func() { close(handling) })
+		<-unblock
+	})
+
+	// Start the first reader here rather than through Connect, so the test can see it return.
+	firstURL := "ws" + strings.TrimPrefix(first.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	conn, resp, err := websocket.DefaultDialer.Dial(firstURL, nil)
+	if resp != nil && resp.Body != nil {
+		resp.Body.Close()
+	}
+	require.NoError(t, err)
+	client.mu.Lock()
+	client.conn = conn
+	client.connClosed = make(chan struct{})
+	client.mu.Unlock()
+	exited := make(chan struct{})
+	go func() {
+		client.receiveMessages(conn)
+		close(exited)
+	}()
+
+	select {
+	case <-handling:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first reader never handled the first server's message")
+	}
+	client.Disconnect()
+	secondURL := "ws" + strings.TrimPrefix(second.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	require.NoError(t, client.Connect(secondURL))
+	defer client.Disconnect()
+	close(unblock)
+
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("the first reader went on reading after its connection was closed")
+	}
+}
