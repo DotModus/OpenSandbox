@@ -9,15 +9,35 @@ stable tag because the controller at that tag writes the commit Job this
 committer runs in, and upstream ships the two together. The previous branch is
 kept unchanged so that images built from it stay reproducible.
 
-Between `release-1.1.1-rc.1` and this tag the image-committer sources changed
-only in tests. The controller's commit Job keeps the same command-line
-arguments, environment (`CONTAINERD_SOCKET`, `SNAPSHOT_REGISTRY_INSECURE`,
-`SOURCE_POD_UID`, `SOURCE_IMAGE_REGISTRY_INSECURE`), registry-credential mount
-and termination message. Snapshot image names now go through
-`--snapshot-image-uri-template`; left empty, the default template produces the
-same `<registry>/<sandbox>-<container>:<tag>` names as before. A retried commit
-Job now keeps the targets recorded for the existing Job. So the controller at
-this tag and the committer built from this branch speak the same contract.
+Between `release-1.1.1-rc.1` and this tag the image-committer's own sources
+changed only in tests, but `kubernetes/go.mod` moves
+`github.com/containerd/containerd` from v1.7.35 to v1.7.36 (a CVE fix), and the
+committer links it. So the binary differs and the image must be rebuilt on
+this tag; the rc.1 build is a rollback target, not an equivalent.
+
+The controller's commit Job keeps the same command-line arguments,
+environment and registry-credential mount, and reads the same termination
+message. The controller sets `CONTAINERD_SOCKET`, `SOURCE_POD_UID` (when the
+source pod is known), `SNAPSHOT_REGISTRY_INSECURE` (when its flag is on) and
+the QEMU-only variables. The committer also reads
+`SOURCE_IMAGE_REGISTRY_INSECURE`, which the controller does not set; only an
+image-committer pod-template overlay can.
+
+Two controller changes touch snapshot targets, neither on the wire:
+
+- Snapshot image names now go through `--snapshot-image-uri-template`. Left
+  empty, the default template produces the same
+  `<registry>/<sandbox>-<container>:<tag>` names as before. Names are now
+  validated before the Job is created (parsed, tag required, no digest, no
+  duplicate targets), and an invalid one fails the snapshot with
+  `InvalidSnapshotImage`.
+- A snapshot that re-enters `Pending` while its commit Job exists now finds
+  that Job before resolving targets again, so it no longer re-resolves and
+  re-persists them. Retries of the Job's pod always reused the same
+  arguments.
+
+So the controller at this tag and the committer built from this branch speak
+the same contract.
 
 ## Patches carried here
 
