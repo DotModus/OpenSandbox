@@ -25,8 +25,28 @@ run that had already replied is finalized without the extra error. As in
 `handleExecutionError`, the error is sent before it is recorded, so a
 `finalizeExecution` already polling cannot close the channel first.
 
-A client sees one new `error` event (`ename` `KernelStopped`) where the stream
-used to hang; nothing else changes.
+Where the stream used to hang, a client now sees the events of an ordinary
+failing cell: `status`, `error` (`ename` `KernelStopped`), then
+`execution_complete`, and the stream closes. Nothing else changes.
+
+What this does not cover:
+
+- **Code that holds the GIL.** ipykernel answers a shutdown request from its
+  control thread, which needs the GIL. Native code that keeps the GIL blocks
+  it, so no `shutdown_reply` arrives; the kernel is killed after the shutdown
+  wait, and Jupyter Server sends no `restarting` or `dead` for a kernel it shut
+  down on purpose. That run still waits until the client gives up. Native code
+  that releases the GIL while it works (a DuckDB query, for one) is covered.
+- **A websocket that drops mid-run.** `receiveMessages` stops on a read error
+  and the run waits until the client gives up, as before. Ending the run there
+  needs the reader to know which run owns the connection (a late read error
+  from one run's closed socket must not end the next run on the same client),
+  so it is left out of this patch.
+- **Ordering after a stray `idle`.** Handlers do not match status messages to
+  the request's `msg_id` (unchanged upstream behaviour). If an unrelated
+  `idle` starts finalization before the kernel stops, `execution_complete`
+  can arrive before the `KernelStopped` error; the error still arrives before
+  the stream closes.
 
 The `components/execd/pkg/jupyter/execute` package is unchanged between
 `release-1.1.1-rc.1`, this tag, upstream `main` at the time of the cut, and

@@ -392,3 +392,66 @@ func TestExecuteCodeStreamEndsWhenKernelStopsMidExecution(t *testing.T) {
 		})
 	}
 }
+
+// TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing covers a kernel that stops after an idle
+// status has already started finalizeExecution, so finalization is polling for a reply that will
+// never come. The KernelStopped error must still reach the client before the stream closes: the
+// error is sent before it is recorded, and recording it is what ends the poll.
+func TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing(t *testing.T) {
+	previousPollInterval := execdflag.JupyterIdlePollInterval
+	execdflag.JupyterIdlePollInterval = 5 * time.Millisecond
+	t.Cleanup(func() {
+		execdflag.JupyterIdlePollInterval = previousPollInterval
+	})
+
+	release := make(chan struct{})
+	server := createTestServer(t, func(conn *websocket.Conn) {
+		var executeRequest Message
+		if err := conn.ReadJSON(&executeRequest); err != nil {
+			t.Errorf("failed to read execution request: %v", err)
+			return
+		}
+		session := executeRequest.Header.Session
+		idle, _ := json.Marshal(StatusUpdate{ExecutionState: StateIdle})
+		require.NoError(t, conn.WriteJSON(Message{
+			Header:  Header{MessageID: "stray-idle-id", Session: session, MessageType: string(MsgStatus)},
+			Content: idle,
+		}))
+		// Several poll intervals, so finalizeExecution is polling when the kernel stops.
+		time.Sleep(50 * time.Millisecond)
+		restarting, _ := json.Marshal(StatusUpdate{ExecutionState: StateRestarting})
+		require.NoError(t, conn.WriteJSON(Message{
+			Header:  Header{MessageID: "restarting-id", Session: session, MessageType: string(MsgStatus)},
+			Content: restarting,
+		}))
+		<-release
+	})
+	defer server.Close()
+	defer close(release)
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+	client := NewClient("", nil)
+	require.NoError(t, client.Connect(wsURL))
+	defer client.Disconnect()
+
+	resultChan := make(chan *ExecutionResult, 10)
+	require.NoError(t, client.ExecuteCodeStream("import duckdb  # a join that ignores interrupts", resultChan))
+
+	var stopped *ErrorOutput
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case result, open := <-resultChan:
+			if !open {
+				require.NotNil(t, stopped, "the KernelStopped error must arrive before the stream closes")
+				require.Equal(t, "KernelStopped", stopped.EName)
+				return
+			}
+			if result != nil && result.Error != nil {
+				stopped = result.Error
+			}
+		case <-deadline:
+			t.Fatal("the stream did not end after the kernel stopped")
+		}
+	}
+}
