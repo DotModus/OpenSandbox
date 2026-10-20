@@ -348,13 +348,13 @@ func TestExecuteCodeStreamEndsWhenKernelStopsMidExecution(t *testing.T) {
 					return
 				}
 				busy, _ := json.Marshal(StatusUpdate{ExecutionState: StateBusy})
-				require.NoError(t, conn.WriteJSON(Message{
+				busyMsg := Message{
 					Header:       Header{MessageID: "busy-id", Session: executeRequest.Header.Session, MessageType: string(MsgStatus)},
 					ParentHeader: executeRequest.Header,
 					Content:      busy,
-				}))
-				for _, msg := range tc.messages(executeRequest.Header.Session, executeRequest.Header) {
-					require.NoError(t, conn.WriteJSON(msg))
+				}
+				if !writeMessages(t, conn, append([]Message{busyMsg}, tc.messages(executeRequest.Header.Session, executeRequest.Header)...)...) {
+					return
 				}
 				// Jupyter Server leaves the websocket open after the kernel is gone.
 				<-release
@@ -415,18 +415,22 @@ func TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing(t *testing.T) {
 		}
 		session := executeRequest.Header.Session
 		idle, _ := json.Marshal(StatusUpdate{ExecutionState: StateIdle})
-		require.NoError(t, conn.WriteJSON(Message{
+		if !writeMessages(t, conn, Message{
 			Header:       Header{MessageID: "idle-id", Session: session, MessageType: string(MsgStatus)},
 			ParentHeader: executeRequest.Header,
 			Content:      idle,
-		}))
+		}) {
+			return
+		}
 		// Several poll intervals, so finalizeExecution is polling when the kernel stops.
 		time.Sleep(50 * time.Millisecond)
 		restarting, _ := json.Marshal(StatusUpdate{ExecutionState: StateRestarting})
-		require.NoError(t, conn.WriteJSON(Message{
+		if !writeMessages(t, conn, Message{
 			Header:  Header{MessageID: "restarting-id", Session: session, MessageType: string(MsgStatus)},
 			Content: restarting,
-		}))
+		}) {
+			return
+		}
 		<-release
 	})
 	defer server.Close()
@@ -459,15 +463,32 @@ func TestExecuteCodeStreamEndsWhenKernelStopsWhileFinalizing(t *testing.T) {
 	}
 }
 
+// kernelMessage builds a message as the kernel would send it. Test servers call it from their
+// handler goroutines, so it reports a failure with t.Errorf rather than stopping the test.
 func kernelMessage(t *testing.T, msgType MessageType, id, session string, parent Header, content interface{}) Message {
 	t.Helper()
 	raw, err := json.Marshal(content)
-	require.NoError(t, err)
+	if err != nil {
+		t.Errorf("failed to marshal %s content: %v", msgType, err)
+	}
 	return Message{
 		Header:       Header{MessageID: id, Session: session, MessageType: string(msgType)},
 		ParentHeader: parent,
 		Content:      raw,
 	}
+}
+
+// writeMessages sends msgs from a test server's handler goroutine, which must not call t.FailNow.
+// It reports whether every write succeeded, so the handler can return on failure.
+func writeMessages(t *testing.T, conn *websocket.Conn, msgs ...Message) bool {
+	t.Helper()
+	for _, msg := range msgs {
+		if err := conn.WriteJSON(msg); err != nil {
+			t.Errorf("failed to write %s: %v", msg.Header.MessageType, err)
+			return false
+		}
+	}
+	return true
 }
 
 // collectResults reads resultChan until it is closed, failing the test if that takes too long.
@@ -509,15 +530,15 @@ func TestExecuteCodeStreamIgnoresIdleOfAnotherRequest(t *testing.T) {
 		session := executeRequest.Header.Session
 		own := executeRequest.Header
 		kernelInfo := Header{MessageID: "kernel-info-request-id", MessageType: string(MsgKernelInfo)}
-		for _, msg := range []Message{
+		if !writeMessages(t, conn,
 			kernelMessage(t, MsgStatus, "info-busy", session, kernelInfo, StatusUpdate{ExecutionState: StateBusy}),
 			kernelMessage(t, MsgStatus, "info-idle", session, kernelInfo, StatusUpdate{ExecutionState: StateIdle}),
-		} {
-			require.NoError(t, conn.WriteJSON(msg))
+		) {
+			return
 		}
 		// Many poll intervals: a run that took that idle as its own would end here.
 		time.Sleep(50 * time.Millisecond)
-		for _, msg := range []Message{
+		if !writeMessages(t, conn,
 			kernelMessage(t, MsgStatus, "own-busy", session, own, StatusUpdate{ExecutionState: StateBusy}),
 			kernelMessage(t, MsgExecuteResult, "own-result", session, own, ExecuteResult{
 				ExecutionCount: 2,
@@ -525,8 +546,8 @@ func TestExecuteCodeStreamIgnoresIdleOfAnotherRequest(t *testing.T) {
 			}),
 			kernelMessage(t, MsgExecuteReply, "own-reply", session, own, ExecuteReply{ExecutionCount: 2, Status: "ok"}),
 			kernelMessage(t, MsgStatus, "own-idle", session, own, StatusUpdate{ExecutionState: StateIdle}),
-		} {
-			require.NoError(t, conn.WriteJSON(msg))
+		) {
+			return
 		}
 		<-release
 	})
@@ -576,7 +597,7 @@ func TestExecuteCodeStreamIgnoresOutputOfAnotherRequest(t *testing.T) {
 		session := executeRequest.Header.Session
 		own := executeRequest.Header
 		earlier := Header{MessageID: "earlier-execute-request-id", MessageType: string(MsgExecuteRequest)}
-		for _, msg := range []Message{
+		if !writeMessages(t, conn,
 			kernelMessage(t, MsgStream, "earlier-stream", session, earlier, StreamOutput{Name: StreamStdout, Text: "earlier\n"}),
 			kernelMessage(t, MsgError, "earlier-error", session, earlier, ErrorOutput{EName: "EarlierError", EValue: "earlier"}),
 			kernelMessage(t, MsgExecuteResult, "earlier-result", session, earlier, ExecuteResult{
@@ -585,17 +606,17 @@ func TestExecuteCodeStreamIgnoresOutputOfAnotherRequest(t *testing.T) {
 			}),
 			kernelMessage(t, MsgExecuteReply, "earlier-reply", session, earlier, ExecuteReply{ExecutionCount: 1, Status: "ok"}),
 			kernelMessage(t, MsgStatus, "earlier-idle", session, earlier, StatusUpdate{ExecutionState: StateIdle}),
-		} {
-			require.NoError(t, conn.WriteJSON(msg))
+		) {
+			return
 		}
 		time.Sleep(50 * time.Millisecond)
-		for _, msg := range []Message{
+		if !writeMessages(t, conn,
 			kernelMessage(t, MsgStatus, "own-busy", session, own, StatusUpdate{ExecutionState: StateBusy}),
 			kernelMessage(t, MsgStream, "own-stream", session, own, StreamOutput{Name: StreamStdout, Text: "own\n"}),
 			kernelMessage(t, MsgExecuteReply, "own-reply", session, own, ExecuteReply{ExecutionCount: 2, Status: "ok"}),
 			kernelMessage(t, MsgStatus, "own-idle", session, own, StatusUpdate{ExecutionState: StateIdle}),
-		} {
-			require.NoError(t, conn.WriteJSON(msg))
+		) {
+			return
 		}
 		<-release
 	})
@@ -663,12 +684,12 @@ func TestExecuteCodeStreamWakesKernelThatHasNotPickedUpTheRequest(t *testing.T) 
 		}
 		session := executeRequest.Header.Session
 		own := executeRequest.Header
-		for _, msg := range []Message{
+		if !writeMessages(t, conn,
 			kernelMessage(t, MsgStatus, "own-busy", session, own, StatusUpdate{ExecutionState: StateBusy}),
 			kernelMessage(t, MsgExecuteReply, "own-reply", session, own, ExecuteReply{ExecutionCount: 1, Status: "ok"}),
 			kernelMessage(t, MsgStatus, "own-idle", session, own, StatusUpdate{ExecutionState: StateIdle}),
-		} {
-			require.NoError(t, conn.WriteJSON(msg))
+		) {
+			return
 		}
 		<-release
 	})
@@ -711,14 +732,16 @@ func TestExecuteCodeStreamDoesNotWakeKernelThatPickedUpTheRequest(t *testing.T) 
 		}
 		session := executeRequest.Header.Session
 		own := executeRequest.Header
-		require.NoError(t, conn.WriteJSON(kernelMessage(t, MsgStatus, "own-busy", session, own, StatusUpdate{ExecutionState: StateBusy})))
+		if !writeMessages(t, conn, kernelMessage(t, MsgStatus, "own-busy", session, own, StatusUpdate{ExecutionState: StateBusy})) {
+			return
+		}
 		// Longer than every wake-up attempt put together.
 		time.Sleep(200 * time.Millisecond)
-		for _, msg := range []Message{
+		if !writeMessages(t, conn,
 			kernelMessage(t, MsgExecuteReply, "own-reply", session, own, ExecuteReply{ExecutionCount: 1, Status: "ok"}),
 			kernelMessage(t, MsgStatus, "own-idle", session, own, StatusUpdate{ExecutionState: StateIdle}),
-		} {
-			require.NoError(t, conn.WriteJSON(msg))
+		) {
+			return
 		}
 		<-release
 	})
