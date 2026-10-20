@@ -34,15 +34,18 @@ import (
 // A kernel can leave a request unread on its shell socket. ipykernel 7.0 to 7.3 sends replies
 // directly on the socket it reads requests from, and that send can consume the read event for a
 // request arriving at the same moment (ipython/ipykernel#1529, fixed in 7.4.0). The request then
-// stays unread until something else wakes the socket, such as a new connection to it. Jupyter
-// Server sends a kernel_info_request on every new websocket, and a run connects just before it
-// sends its request, so the reply to that kernel_info_request regularly meets the request.
+// stays unread until something else wakes the socket, such as a new connection to it. On every new
+// websocket Jupyter Server sends a kernel_info_request on the shell and control channels (unless it
+// believes the kernel is busy), and a run connects just before it sends its request, so the shell
+// reply to that kernel_info_request regularly meets the request.
 //
-// A run whose kernel has sent nothing for its request after kernelWakeDelay opens and closes
+// A run that has received nothing for its request kernelWakeDelay after sending it opens and closes
 // another websocket: Jupyter Server connects new sockets to the kernel for it, which wakes the
 // shell socket. Another message on the run's own connection would not: it arrives on the same zmq
 // pipe as the unread request, which raises no new read event. The delay doubles after each of
-// kernelWakeAttempts attempts.
+// kernelWakeAttempts attempts. Waking stops when anything for the request arrives, when the run
+// ends, or when the run's connection is closed. A kernel still busy with an earlier request also
+// sends nothing for a while; waking it costs a websocket and is otherwise harmless.
 var (
 	kernelWakeDelay    = 500 * time.Millisecond
 	kernelWakeAttempts = 4
@@ -56,6 +59,8 @@ type Client struct {
 	httpClient HTTPClient
 
 	conn *websocket.Conn
+	// connClosed is closed when conn is disconnected.
+	connClosed chan struct{}
 
 	handlers map[MessageType]func(*Message)
 
@@ -91,6 +96,7 @@ func (c *Client) Connect(wsURL string) error {
 		return fmt.Errorf("failed to connect to kernel: %w", err)
 	}
 	c.conn = conn
+	c.connClosed = make(chan struct{})
 
 	c.registerDefaultHandlers()
 
@@ -106,6 +112,7 @@ func (c *Client) Disconnect() {
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil
+		close(c.connClosed)
 	}
 }
 
@@ -209,29 +216,49 @@ func (c *Client) ExecuteCodeStream(code string, resultChan chan *ExecutionResult
 		return fmt.Errorf("failed to send execution request: %w", err)
 	}
 
+	c.mu.Lock()
+	connClosed := c.connClosed
+	c.mu.Unlock()
 	delay, attempts := kernelWakeDelay, kernelWakeAttempts
-	safego.Go(func() { c.wakeKernelUntilPickedUp(state, delay, attempts) })
+	safego.Go(func() { c.wakeKernelUntilPickedUp(state, connClosed, delay, attempts) })
 
 	return nil
 }
 
-// wakeKernelUntilPickedUp wakes a kernel that has not picked up the run's request, see
-// kernelWakeDelay.
-func (c *Client) wakeKernelUntilPickedUp(state *streamExecutionState, delay time.Duration, attempts int) {
-	for range attempts {
+// wakeKernelUntilPickedUp wakes a kernel that may have left the run's request unread, see
+// kernelWakeDelay. connClosed is closed when the run's connection is.
+func (c *Client) wakeKernelUntilPickedUp(state *streamExecutionState, connClosed <-chan struct{}, delay time.Duration, attempts int) {
+	for attempt := 1; attempt <= attempts; attempt++ {
 		timer := time.NewTimer(delay)
 		select {
 		case <-state.pickedUp:
-			timer.Stop()
-			return
 		case <-state.ended:
-			timer.Stop()
-			return
+		case <-connClosed:
 		case <-timer.C:
 		}
-		log.Warn("jupyter: kernel has sent nothing for request %s after %s; waking it", state.msgID, time.Since(state.startTime))
+		timer.Stop()
+		if state.wakeNotNeeded(connClosed) {
+			return
+		}
+		log.Info("jupyter: nothing yet for request %s after %s; opening another kernel connection in case the kernel left it unread (attempt %d of %d)",
+			state.msgID, time.Since(state.startTime).Round(time.Millisecond), attempt, attempts)
 		c.wakeKernel()
 		delay *= 2
+	}
+}
+
+// wakeNotNeeded reports whether the kernel picked up the request, the run ended, or the run's
+// connection was closed.
+func (state *streamExecutionState) wakeNotNeeded(connClosed <-chan struct{}) bool {
+	select {
+	case <-state.pickedUp:
+		return true
+	case <-state.ended:
+		return true
+	case <-connClosed:
+		return true
+	default:
+		return false
 	}
 }
 

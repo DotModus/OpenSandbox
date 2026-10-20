@@ -758,3 +758,69 @@ func TestExecuteCodeStreamDoesNotWakeKernelThatPickedUpTheRequest(t *testing.T) 
 	collectResults(t, resultChan)
 	require.Equal(t, int32(1), connections.Load(), "a kernel that picked up the request must not be woken")
 }
+
+// TestExecuteCodeStreamStopsWakingKernel covers the two ways a run can finish with nothing for its
+// request ever arriving: its kernel stopped, which ends the run, or the run gave up and closed its
+// connection (runJupyterCode does so when its context is cancelled). Waking must stop with it: a
+// wake-up after that would reach the same kernel during the next run, and the kernel's reply to
+// the extra kernel_info_request can itself meet the next run's request.
+func TestExecuteCodeStreamStopsWakingKernel(t *testing.T) {
+	cases := []struct {
+		name string
+		// kernelStops makes the server end the run with a dead status; otherwise the client
+		// disconnects.
+		kernelStops bool
+	}{
+		{name: "run ended", kernelStops: true},
+		{name: "connection closed", kernelStops: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			setKernelWake(t, 50*time.Millisecond, 3)
+
+			var connections atomic.Int32
+			requested := make(chan struct{})
+			release := make(chan struct{})
+			server := createTestServer(t, func(conn *websocket.Conn) {
+				if connections.Add(1) > 1 {
+					return
+				}
+				var executeRequest Message
+				if err := conn.ReadJSON(&executeRequest); err != nil {
+					t.Errorf("failed to read execution request: %v", err)
+					return
+				}
+				close(requested)
+				if tc.kernelStops {
+					dead, _ := json.Marshal(StatusUpdate{ExecutionState: StateDead})
+					if !writeMessages(t, conn, Message{
+						Header:  Header{MessageID: "dead-id", Session: executeRequest.Header.Session, MessageType: string(MsgStatus)},
+						Content: dead,
+					}) {
+						return
+					}
+				}
+				<-release
+			})
+			defer server.Close()
+			defer close(release)
+
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/api/kernels/test-kernel-id/channels"
+			client := NewClient("", nil)
+			require.NoError(t, client.Connect(wsURL))
+			defer client.Disconnect()
+
+			resultChan := make(chan *ExecutionResult, 10)
+			require.NoError(t, client.ExecuteCodeStream("x", resultChan))
+			<-requested
+			if tc.kernelStops {
+				collectResults(t, resultChan)
+			} else {
+				client.Disconnect()
+			}
+			// Longer than every wake-up attempt put together (50 + 100 + 200 ms).
+			time.Sleep(500 * time.Millisecond)
+			require.Equal(t, int32(1), connections.Load(), "no wake-up may follow the end of the run or its connection")
+		})
+	}
+}
