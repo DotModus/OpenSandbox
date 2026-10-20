@@ -28,6 +28,27 @@ import (
 	"github.com/gorilla/websocket"
 
 	execdflag "github.com/alibaba/opensandbox/execd/pkg/flag"
+	"github.com/alibaba/opensandbox/execd/pkg/log"
+)
+
+// A kernel can leave a request unread on its shell socket. ipykernel 7.0 to 7.3 sends replies
+// directly on the socket it reads requests from, and that send can consume the read event for a
+// request arriving at the same moment (ipython/ipykernel#1529, fixed in 7.4.0). The request then
+// stays unread until something else wakes the socket, such as a new connection to it. On every new
+// websocket Jupyter Server sends a kernel_info_request on the shell and control channels (unless it
+// believes the kernel is busy), and a run connects just before it sends its request, so the shell
+// reply to that kernel_info_request regularly meets the request.
+//
+// A run that has received nothing for its request kernelWakeDelay after sending it opens and closes
+// another websocket: Jupyter Server connects new sockets to the kernel for it, which wakes the
+// shell socket. Another message on the run's own connection would not: it arrives on the same zmq
+// pipe as the unread request, which raises no new read event. The delay doubles after each of
+// kernelWakeAttempts attempts. Waking stops when anything for the request arrives, when the run
+// ends, or when the run's connection is closed. A kernel still busy with an earlier request also
+// sends nothing for a while; waking it costs a websocket and is otherwise harmless.
+var (
+	kernelWakeDelay    = 500 * time.Millisecond
+	kernelWakeAttempts = 4
 )
 
 type HTTPClient interface {
@@ -38,6 +59,8 @@ type Client struct {
 	httpClient HTTPClient
 
 	conn *websocket.Conn
+	// connClosed is closed when conn is disconnected.
+	connClosed chan struct{}
 
 	handlers map[MessageType]func(*Message)
 
@@ -73,10 +96,11 @@ func (c *Client) Connect(wsURL string) error {
 		return fmt.Errorf("failed to connect to kernel: %w", err)
 	}
 	c.conn = conn
+	c.connClosed = make(chan struct{})
 
 	c.registerDefaultHandlers()
 
-	safego.Go(func() { c.receiveMessages() })
+	safego.Go(func() { c.receiveMessages(conn) })
 
 	return nil
 }
@@ -88,6 +112,7 @@ func (c *Client) Disconnect() {
 	if c.conn != nil {
 		c.conn.Close()
 		c.conn = nil
+		close(c.connClosed)
 	}
 }
 
@@ -103,6 +128,17 @@ type streamExecutionState struct {
 	executeDone  bool
 	executeMutex sync.Mutex
 	resultMutex  sync.Mutex
+
+	// msgID is the msg_id of this run's execute_request. The kernel sets it as the parent of every
+	// message that answers the request. The run's connection also carries messages for other
+	// requests: the busy and idle statuses for Jupyter Server's kernel_info_request on connect, and
+	// the output of an earlier run that is still going. Those are not this run's.
+	msgID string
+	// pickedUp is closed by the first message for msgID: the kernel is working on the request.
+	pickedUp     chan struct{}
+	pickedUpOnce sync.Once
+	// ended is closed with resultChan.
+	ended chan struct{}
 
 	// chanMutex guards resultChan's close-vs-send race. state.result.ExecutionCount/Error can be
 	// set by handleExecuteReply with no corresponding resultChan send at all (e.g. plain print()
@@ -124,7 +160,18 @@ func newStreamExecutionState(startTime time.Time) *streamExecutionState {
 			Stream:        make([]*StreamOutput, 0),
 			ExecutionTime: 0,
 		},
+		pickedUp: make(chan struct{}),
+		ended:    make(chan struct{}),
 	}
+}
+
+// owns reports whether msg answers this run's request, and records that the kernel picked it up.
+func (state *streamExecutionState) owns(msg *Message) bool {
+	if msg.ParentHeader.MessageID != state.msgID {
+		return false
+	}
+	state.pickedUpOnce.Do(func() { close(state.pickedUp) })
+	return true
 }
 
 // trySend delivers notify on resultChan unless the channel has already been closed. It must be
@@ -146,6 +193,7 @@ func (state *streamExecutionState) closeResultChan(resultChan chan *ExecutionRes
 	defer state.chanMutex.Unlock()
 	state.closed = true
 	close(resultChan)
+	close(state.ended)
 }
 
 func (c *Client) ExecuteCodeStream(code string, resultChan chan *ExecutionResult) error {
@@ -159,6 +207,7 @@ func (c *Client) ExecuteCodeStream(code string, resultChan chan *ExecutionResult
 	}
 
 	state := newStreamExecutionState(time.Now())
+	state.msgID = msg.Header.MessageID
 
 	c.clearTemporaryHandlers()
 	c.registerExecuteCodeStreamHandlers(state, resultChan)
@@ -167,7 +216,68 @@ func (c *Client) ExecuteCodeStream(code string, resultChan chan *ExecutionResult
 		return fmt.Errorf("failed to send execution request: %w", err)
 	}
 
+	c.mu.Lock()
+	connClosed := c.connClosed
+	c.mu.Unlock()
+	delay, attempts := kernelWakeDelay, kernelWakeAttempts
+	safego.Go(func() { c.wakeKernelUntilPickedUp(state, connClosed, delay, attempts) })
+
 	return nil
+}
+
+// wakeKernelUntilPickedUp wakes a kernel that may have left the run's request unread, see
+// kernelWakeDelay. connClosed is closed when the run's connection is.
+func (c *Client) wakeKernelUntilPickedUp(state *streamExecutionState, connClosed <-chan struct{}, delay time.Duration, attempts int) {
+	for attempt := 1; attempt <= attempts; attempt++ {
+		timer := time.NewTimer(delay)
+		select {
+		case <-state.pickedUp:
+		case <-state.ended:
+		case <-connClosed:
+		case <-timer.C:
+		}
+		timer.Stop()
+		if state.wakeNotNeeded(connClosed) {
+			return
+		}
+		log.Info("jupyter: nothing yet for request %s after %s; opening another kernel connection in case the kernel left it unread (attempt %d of %d)",
+			state.msgID, time.Since(state.startTime).Round(time.Millisecond), attempt, attempts)
+		c.wakeKernel()
+		delay *= 2
+	}
+}
+
+// wakeNotNeeded reports whether the kernel picked up the request, the run ended, or the run's
+// connection was closed.
+func (state *streamExecutionState) wakeNotNeeded(connClosed <-chan struct{}) bool {
+	select {
+	case <-state.pickedUp:
+		return true
+	case <-state.ended:
+		return true
+	case <-connClosed:
+		return true
+	default:
+		return false
+	}
+}
+
+// wakeKernel opens and closes a websocket to the kernel. Jupyter Server connects new sockets to the
+// kernel for it, and the kernel's shell socket then reads any request it left unread.
+func (c *Client) wakeKernel() {
+	c.mu.Lock()
+	wsURL := c.wsURL
+	c.mu.Unlock()
+
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if resp != nil && err != nil {
+		resp.Body.Close()
+	}
+	if err != nil {
+		log.Warn("jupyter: wake kernel: %v", err)
+		return
+	}
+	conn.Close()
 }
 
 func (c *Client) buildExecuteMessage(code string) (*Message, error) {
@@ -204,18 +314,31 @@ func (c *Client) buildExecuteMessage(code string) (*Message, error) {
 	return msg, nil
 }
 
+// registerExecuteCodeStreamHandlers registers the run's handlers. They are in place before the
+// request is sent, so nothing the kernel sends for it can arrive first. Replies, output and idle
+// statuses count only when they answer the run's request; a stopped kernel ends the run whatever
+// the parent, since its shutdown_reply answers Jupyter Server's shutdown_request and its restarting
+// and dead statuses come from Jupyter Server itself.
 func (c *Client) registerExecuteCodeStreamHandlers(state *streamExecutionState, resultChan chan *ExecutionResult) {
 	c.registerHandler(MsgExecuteReply, func(msg *Message) {
-		c.handleExecuteReply(msg, state)
+		if state.owns(msg) {
+			c.handleExecuteReply(msg, state)
+		}
 	})
 	c.registerHandler(MsgExecuteResult, func(msg *Message) {
-		c.handleExecuteResult(msg, state, resultChan)
+		if state.owns(msg) {
+			c.handleExecuteResult(msg, state, resultChan)
+		}
 	})
 	c.registerHandler(MsgStream, func(msg *Message) {
-		c.handleStreamOutput(msg, state, resultChan)
+		if state.owns(msg) {
+			c.handleStreamOutput(msg, state, resultChan)
+		}
 	})
 	c.registerHandler(MsgError, func(msg *Message) {
-		c.handleExecutionError(msg, state, resultChan)
+		if state.owns(msg) {
+			c.handleExecutionError(msg, state, resultChan)
+		}
 	})
 	c.registerHandler(MsgStatus, func(msg *Message) {
 		c.handleExecutionStatus(msg, state, resultChan)
@@ -311,8 +434,9 @@ func (c *Client) handleExecutionStatus(msg *Message, state *streamExecutionState
 	case StateDead:
 		c.handleKernelStopped(state, resultChan, "the kernel died before the execution finished")
 		return
-	case StateIdle:
-	default:
+	}
+	// Any other status answers one request, and only the idle for this run's request ends it.
+	if !state.owns(msg) || status.ExecutionState != StateIdle {
 		return
 	}
 
@@ -506,21 +630,15 @@ func (c *Client) clearTemporaryHandlers() {
 	c.registerDefaultHandlers()
 }
 
-func (c *Client) receiveMessages() {
+// receiveMessages dispatches the messages read from conn until it is closed. It reads only the
+// connection it was started for: a reader still handling a message when its run disconnects must
+// not go on to read the next run's connection alongside that connection's own reader.
+func (c *Client) receiveMessages(conn *websocket.Conn) {
 	for {
-		c.mu.Lock()
-		conn := c.conn
-		c.mu.Unlock()
-
-		if conn == nil {
-			break
-		}
-
 		var msg Message
-		err := conn.ReadJSON(&msg)
-		if err != nil {
+		if err := conn.ReadJSON(&msg); err != nil {
 			// connection may already be closed
-			break
+			return
 		}
 
 		c.handleMessage(&msg)
